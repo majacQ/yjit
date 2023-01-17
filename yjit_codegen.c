@@ -3144,6 +3144,19 @@ gen_send_cfunc(jitstate_t *jit, ctx_t *ctx, const struct rb_callinfo *ci, const 
     cmp(cb, REG_CFP, REG0);
     jle_ptr(cb, COUNTED_EXIT(side_exit, send_se_cf_overflow));
 
+
+
+
+    if (getenv("DUMP_CALL_SITES"))
+    {
+        char buffer[128];
+        sprintf(buffer, "CFUNC_CALL_AT_%08x", cb->write_pos);
+        print_str(cb, buffer);
+    }
+
+
+
+
     // Points to the receiver operand on the stack
     x86opnd_t recv = ctx_stack_opnd(ctx, argc);
 
@@ -3441,6 +3454,19 @@ gen_send_iseq(jitstate_t *jit, ctx_t *ctx, const struct rb_callinfo *ci, const r
     lea(cb, REG0, ctx_sp_opnd(ctx, sizeof(VALUE) * (num_locals + iseq->body->stack_max) + 2 * sizeof(rb_control_frame_t)));
     cmp(cb, REG_CFP, REG0);
     jle_ptr(cb, COUNTED_EXIT(side_exit, send_se_cf_overflow));
+
+
+
+    if (getenv("DUMP_CALL_SITES"))
+    {
+        char buffer[128];
+        sprintf(buffer, "ISEQ_CALL_AT_%08x", cb->write_pos);
+        print_str(cb, buffer);
+    }
+
+
+
+
 
     // Points to the receiver operand on the stack
     x86opnd_t recv = ctx_stack_opnd(ctx, argc);
