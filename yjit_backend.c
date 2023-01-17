@@ -232,6 +232,13 @@ const char* ir_op_name(int op)
     {
         case OP_ADD: return "add";
         case OP_AND: return "and";
+        case OP_CALL: return "call";
+        case OP_CCALL: return "ccall";
+        case OP_CMOV_GE: return "cmovge";
+        case OP_CMOV_GT: return "cmovg";
+        case OP_CMOV_LE: return "cmovle";
+        case OP_CMOV_LT: return "cmovl";
+        case OP_CMP: return "cmp";
         case OP_COMMENT: return "comment";
         case OP_JUMP_EQ: return "jumpeq";
         case OP_JUMP_NE: return "jumpne";
@@ -241,10 +248,15 @@ const char* ir_op_name(int op)
         case OP_NOT: return "not";
         case OP_RET: return "ret";
         case OP_RETVAL: return "retval";
+        case OP_SELECT_GE: return "selectge";
+        case OP_SELECT_GT: return "selectgt";
+        case OP_SELECT_LE: return "selectle";
+        case OP_SELECT_LT: return "selectlt";
         case OP_SUB: return "sub";
 
         default:
             RUBY_ASSERT(false && "unknown opnd type");
+            return "unknown";
     }
 }
 
@@ -302,15 +314,23 @@ void ir_print_to_dot(jitstate_t *jit)
 /* Convenience methods for pushing instructions. */
 /*************************************************/
 
-ir_opnd_t ir_add(jitstate_t *jit, ir_opnd_t opnd0, ir_opnd_t opnd1)
-{
-    return ir_push_insn(jit, OP_ADD, opnd0, opnd1);
-}
+#define ir_add(jit, opnd0, opnd1) ir_push_insn(jit, OP_ADD, opnd0, opnd1)
 
-ir_opnd_t ir_and(jitstate_t *jit, ir_opnd_t opnd0, ir_opnd_t opnd1)
-{
-    return ir_push_insn(jit, OP_AND, opnd0, opnd1);
-}
+#define ir_and(jit, opnd0, opnd1) ir_push_insn(jit, OP_AND, opnd0, opnd1)
+
+#define ir_ccall(jit, ...) ir_push_insn(jit, OP_CCALL, __VA_ARGS__)
+
+#define ir_cmov_ge(jit, opnd0, opnd1) \
+    ir_push_insn(jit, OP_CMOV_GE, opnd0, opnd1)
+
+#define ir_cmov_gt(jit, opnd0, opnd1) \
+    ir_push_insn(jit, OP_CMOV_GT, opnd0, opnd1)
+
+#define ir_cmov_le(jit, opnd0, opnd1) \
+    ir_push_insn(jit, OP_CMOV_LE, opnd0, opnd1)
+
+#define ir_cmov_lt(jit, opnd0, opnd1) \
+    ir_push_insn(jit, OP_CMOV_LT, opnd0, opnd1)
 
 void ir_comment(jitstate_t *jit, ir_opnd_t opnd)
 {
@@ -347,10 +367,13 @@ ir_opnd_t ir_mov(jitstate_t *jit, ir_opnd_t opnd0, ir_opnd_t opnd1)
     return ir_push_insn(jit, OP_MOV, opnd0, opnd1);
 }
 
-ir_opnd_t ir_not(jitstate_t *jit, ir_opnd_t opnd)
+ir_opnd_t ir_cmp(jitstate_t *jit, ir_opnd_t opnd0, ir_opnd_t opnd1)
 {
-    return ir_push_insn(jit, OP_NOT, opnd);
+    RUBY_ASSERT((opnd0.kind == EIR_INSN_OUT || opnd0.kind == EIR_REG) && "can only cmp with a EIR_INSN_OUT or EIR_REG");
+    return ir_push_insn(jit, OP_CMP, opnd0, opnd1);
 }
+
+#define ir_not(jit, opnd) ir_push_insn(jit, OP_NOT, opnd)
 
 void ir_ret(jitstate_t *jit)
 {
@@ -362,10 +385,19 @@ void ir_retval(jitstate_t *jit, ir_opnd_t opnd)
     ir_push_insn(jit, OP_RETVAL, opnd);
 }
 
-ir_opnd_t ir_sub(jitstate_t *jit, ir_opnd_t opnd0, ir_opnd_t opnd1)
-{
-    return ir_push_insn(jit, OP_SUB, opnd0, opnd1);
-}
+#define ir_select_ge(jit, opnd0, opnd1, opnd2, opnd3) \
+    ir_push_insn(jit, OP_SELECT_GE, opnd0, opnd1, opnd2, opnd3)
+
+#define ir_select_gt(jit, opnd0, opnd1, opnd2, opnd3) \
+    ir_push_insn(jit, OP_SELECT_GT, opnd0, opnd1, opnd2, opnd3)
+
+#define ir_select_le(jit, opnd0, opnd1, opnd2, opnd3) \
+    ir_push_insn(jit, OP_SELECT_LE, opnd0, opnd1, opnd2, opnd3)
+
+#define ir_select_lt(jit, opnd0, opnd1, opnd2, opnd3) \
+    ir_push_insn(jit, OP_SELECT_LT, opnd0, opnd1, opnd2, opnd3)
+
+#define ir_sub(jit, opnd0, opnd1) ir_push_insn(jit, OP_SUB, opnd0, opnd1)
 
 /*************************************************/
 /* Register allocation.                          */
@@ -387,7 +419,9 @@ int32_t ir_next_scr_reg_idx(int32_t active[NUM_SCR_REGS])
             return index;
         }
     }
+
     RUBY_ASSERT(false && "out of free registers");
+    return -1;
 }
 
 // When we're about to walk through the instructions and perform some kind of
@@ -396,11 +430,30 @@ int32_t ir_next_scr_reg_idx(int32_t active[NUM_SCR_REGS])
 // to the correct place.
 void ir_swap_insns(jitstate_t *jit)
 {
-    jit->insns_prev = jit->insns;
+    // Grab a reference to the previous set instructions before we swap them.
+    insn_array_t insns = jit->insns_prev;
 
-    // TODO: actually properly handle this memory. We should be freeing the old
-    // list here if there is one.
+    // Set the previous instructions to the current ones and set the current
+    // ones to a new blank darray.
+    jit->insns_prev = jit->insns;
     jit->insns = (insn_array_t) { 0 };
+
+    // If there were previous instructions, then clear them out. (This will
+    // only occur on the second pass and onward.)
+    if (insns)
+        rb_darray_clear(insns);
+}
+
+void ir_insn_free(ir_insn_t insn) {
+    rb_darray_free(insn.opnds);
+}
+
+void ir_jit_clear(jitstate_t *jit) {
+    ir_insn_t *insn;
+    rb_darray_foreach(jit->insns, insn_idx, insn) ir_insn_free(*insn);
+
+    rb_darray_clear(jit->insns);
+    rb_darray_clear(jit->insns_prev);
 }
 
 void ir_alloc_regs(jitstate_t *jit)
@@ -583,6 +636,102 @@ void ir_alloc_regs(jitstate_t *jit)
 
                 break;
             }
+            case OP_CCALL: {
+                ir_opnd_t function = ir_opnd(insn, 0, allocations);
+                ir_opnd_t pointer = function;
+
+                if (function.kind != EIR_REG) {
+                    // Since we don't have as register as the operand that will
+                    // hold the pointer to the function, we have to first
+                    // allocate one and then mov the function pointer into that
+                    // register.
+                    int32_t allocated_index = ir_next_scr_reg_idx(active);
+                    ir_opnd_t allocated = SCR_REGS[allocated_index];
+
+                    allocations[insn_idx] = allocated_index;
+                    active[allocated_index] = last_insn_index;
+
+                    ir_mov(jit, allocated, function);
+                    pointer = allocated;
+                }
+
+                // Create the next instruction manually (doing this instead of
+                // using ir_push_insn since this function accepts variadic
+                // arguments).
+                ir_insn_t call = (ir_insn_t){ .op = OP_CALL };
+                rb_darray_append(&call.opnds, pointer);
+
+                // Starting at index 1 because we're skipping over the function
+                // pointer operand.
+                int32_t opnd_size = rb_darray_size(insn.opnds);
+                for (int32_t opnd_idx = 1; opnd_idx < opnd_size; opnd_idx++) {
+                    rb_darray_append(&call.opnds, ir_opnd(insn, opnd_idx, allocations));
+                }
+
+                rb_darray_append(&jit->insns, call);
+                break;
+            }
+            case OP_SELECT_GE:
+            case OP_SELECT_GT:
+            case OP_SELECT_LE:
+            case OP_SELECT_LT: {
+                ir_opnd_t left = ir_opnd(insn, 0, allocations);
+                ir_opnd_t right = ir_opnd(insn, 1, allocations);
+
+                ir_opnd_t then_case = ir_opnd(insn, 2, allocations);
+                ir_opnd_t else_case = ir_opnd(insn, 3, allocations);
+
+                // Always allocate a register, since we need a place for the
+                // cases to live.
+                int32_t allocated_index = ir_next_scr_reg_idx(active);
+                ir_opnd_t allocated = SCR_REGS[allocated_index];
+
+                allocations[insn_idx] = allocated_index;
+                active[allocated_index] = last_insn_index;
+
+                ir_mov(jit, allocated, left);
+                ir_cmp(jit, allocated, right);
+
+                // Now that the comparison is done, we can safely move the
+                // else_case operand into the allocated register while
+                // maintaining the comparison flags.
+                ir_mov(jit, allocated, else_case);
+
+                if (then_case.kind != EIR_REG) {
+                    // Since we don't have as register as the then_case operand,
+                    // we have to first allocate one and then mov the value into
+                    // that register.
+                    int32_t then_allocated_index = ir_next_scr_reg_idx(active);
+                    ir_opnd_t then_allocated = SCR_REGS[then_allocated_index];
+
+                    active[then_allocated_index] = last_insn_index;
+                    ir_mov(jit, then_allocated, then_case);
+                    then_case = then_allocated;
+                }
+
+                // Now we're going to conditionally move the then_case into the
+                // allocated register depending on if the comparison flags line
+                // up to the expected values depending on the current
+                // instruction.
+                switch (insn.op) {
+                    case OP_SELECT_GE: ir_cmov_ge(jit, allocated, then_case); break;
+                    case OP_SELECT_GT: ir_cmov_gt(jit, allocated, then_case); break;
+                    case OP_SELECT_LE: ir_cmov_le(jit, allocated, then_case); break;
+                    case OP_SELECT_LT: ir_cmov_lt(jit, allocated, then_case); break;
+                }
+
+                break;
+            }
+        }
+
+        switch (insn.op) {
+            // These instructions are just copied over between passes.
+            case OP_CALL:
+            case OP_CMOV_GE:
+            case OP_CMOV_GT:
+            case OP_CMOV_LE:
+            case OP_CMOV_LT:
+            case OP_CMP:
             case OP_COMMENT:
             case OP_JUMP_OVF:
             case OP_LABEL:
@@ -590,8 +739,10 @@ void ir_alloc_regs(jitstate_t *jit)
                 rb_darray_append(&jit->insns, insn);
                 break;
             }
+            // By default we're going to free the previous instruction.
             default:
-                RUBY_ASSERT(false && "unsupported insn op");
+                ir_insn_free(insn);
+                break;
         }
     }
 
@@ -623,6 +774,7 @@ x86opnd_t ir_gen_x86opnd(ir_opnd_t opnd)
             return (x86opnd_t){ OPND_IMM, opnd.num_bits, .as.imm = opnd.as.imm };
         default:
             RUBY_ASSERT(false && "unknown opnd kind");
+            return (x86opnd_t){ 0 };
     }
 }
 
@@ -678,6 +830,57 @@ void ir_gen_x86(codeblock_t *cb, jitstate_t *jit)
                 x86opnd_t opnd0 = ir_gen_x86opnd(rb_darray_get(insn->opnds, 0));
                 x86opnd_t opnd1 = ir_gen_x86opnd(rb_darray_get(insn->opnds, 1));
                 and(cb, opnd0, opnd1);
+                break;
+            }
+            case OP_CALL: {
+                x86opnd_t pointer = ir_gen_x86opnd(rb_darray_get(insn->opnds, 0));
+                int32_t opnd_size = rb_darray_size(insn->opnds);
+
+                if (opnd_size > NUM_C_ARG_REGS) {
+                    RUBY_ASSERT(false && "unsupported function argument spill");
+                }
+
+                // TODO: some of these movs may not be necessary, and some of
+                // them may overwrite values we need to keep. Presumably there
+                // should be some smart pushing/popping going on here. At the
+                // moment we're just blinding copying values into the correct
+                // registers.
+                for (int32_t opnd_idx = 1; opnd_idx < opnd_size; opnd_idx++) {
+                    x86opnd_t opnd = ir_gen_x86opnd(rb_darray_get(insn->opnds, opnd_idx));
+                    mov(cb, C_ARG_REGS[opnd_idx - 1], opnd);
+                }
+
+                call(cb, pointer);
+                break;
+            }
+            case OP_CMOV_GE: {
+                x86opnd_t opnd0 = ir_gen_x86opnd(rb_darray_get(insn->opnds, 0));
+                x86opnd_t opnd1 = ir_gen_x86opnd(rb_darray_get(insn->opnds, 1));
+                cmovge(cb, opnd0, opnd1);
+                break;
+            }
+            case OP_CMOV_GT: {
+                x86opnd_t opnd0 = ir_gen_x86opnd(rb_darray_get(insn->opnds, 0));
+                x86opnd_t opnd1 = ir_gen_x86opnd(rb_darray_get(insn->opnds, 1));
+                cmovg(cb, opnd0, opnd1);
+                break;
+            }
+            case OP_CMOV_LE: {
+                x86opnd_t opnd0 = ir_gen_x86opnd(rb_darray_get(insn->opnds, 0));
+                x86opnd_t opnd1 = ir_gen_x86opnd(rb_darray_get(insn->opnds, 1));
+                cmovle(cb, opnd0, opnd1);
+                break;
+            }
+            case OP_CMOV_LT: {
+                x86opnd_t opnd0 = ir_gen_x86opnd(rb_darray_get(insn->opnds, 0));
+                x86opnd_t opnd1 = ir_gen_x86opnd(rb_darray_get(insn->opnds, 1));
+                cmovl(cb, opnd0, opnd1);
+                break;
+            }
+            case OP_CMP: {
+                x86opnd_t opnd0 = ir_gen_x86opnd(rb_darray_get(insn->opnds, 0));
+                x86opnd_t opnd1 = ir_gen_x86opnd(rb_darray_get(insn->opnds, 1));
+                cmp(cb, opnd0, opnd1);
                 break;
             }
             case OP_COMMENT:
@@ -748,6 +951,17 @@ void ir_gen_x86(codeblock_t *cb, jitstate_t *jit)
 /* Tests for the backend.                        */
 /*************************************************/
 
+// These are just here to have functions to call when testing call instructions
+static int64_t ir_test_function_plain()
+{
+    return 7;
+}
+
+static int64_t ir_test_function_add(int64_t left, int64_t right)
+{
+    return left + right;
+}
+
 void test_backend()
 {
     codeblock_t codeblock;
@@ -762,7 +976,7 @@ void test_backend()
     printf("Running backend tests\n");
 
     // Used by the tests to compare function outputs.
-    int64_t expected, actual;
+    int expected, actual;
 
     // Used by the tests to write out the IR instructions.
     jitstate_t jitstate;
@@ -777,10 +991,11 @@ void test_backend()
         ir_alloc_regs(jit); \
         ir_peephole_opt(jit); \
         ir_gen_x86(cb, jit); \
+        ir_jit_clear(jit); \
         expected = EXPECTED; \
         actual = function(); \
         if (expected != actual) { \
-            fprintf(stderr, "%s failed: expected %lld, got %lld\n", NAME, expected, actual); \
+            fprintf(stderr, "%s failed: expected %d, got %d\n", NAME, expected, actual); \
             exit(-1); \
         }
 
@@ -829,7 +1044,7 @@ void test_backend()
     });
 
     TEST("jump equal", 2, {
-        ir_opnd_t label = ir_label_opnd("label");
+        ir_opnd_t label = ir_label_opnd((char *) "label");
         ir_jump_eq(jit, ir_imm(3), ir_imm(3), label);
         ir_retval(jit, ir_imm(1));
         ir_label(jit, label);
@@ -837,7 +1052,7 @@ void test_backend()
     });
 
     TEST("jump not equal", 2, {
-        ir_opnd_t label = ir_label_opnd("label");
+        ir_opnd_t label = ir_label_opnd((char *) "label");
         ir_jump_ne(jit, ir_imm(3), ir_imm(4), label);
         ir_retval(jit, ir_imm(1));
         ir_label(jit, label);
@@ -845,7 +1060,7 @@ void test_backend()
     });
 
     TEST("jump overflow", 2, {
-        ir_opnd_t label = ir_label_opnd("label");
+        ir_opnd_t label = ir_label_opnd((char *) "label");
         ir_add(jit, ir_imm(INT64_MAX), ir_imm(1));
         ir_jump_ovf(jit, label);
         ir_retval(jit, ir_imm(1));
@@ -853,47 +1068,123 @@ void test_backend()
         ir_retval(jit, ir_imm(2));
     })
 
+    TEST("call plain", 7, {
+        ir_retval(jit, ir_ccall(jit, ir_const_ptr((void *)&ir_test_function_plain)));
+    });
+
+    TEST("call with arguments", 7, {
+        ir_retval(jit, ir_ccall(jit, ir_const_ptr((void *)&ir_test_function_add), ir_imm(3), ir_imm(4)));
+    });
+
+    TEST("select greater than or equal to", 1, {
+        ir_retval(jit, ir_select_ge(jit, ir_imm(3), ir_imm(3), ir_imm(1), ir_imm(2)));
+    })
+
+    TEST("select not greater than or equal to", 2, {
+        ir_retval(jit, ir_select_ge(jit, ir_imm(3), ir_imm(4), ir_imm(1), ir_imm(2)));
+    })
+
+    TEST("select greater than", 1, {
+        ir_retval(jit, ir_select_gt(jit, ir_imm(4), ir_imm(3), ir_imm(1), ir_imm(2)));
+    })
+
+    TEST("select not greater than", 2, {
+        ir_retval(jit, ir_select_gt(jit, ir_imm(3), ir_imm(3), ir_imm(1), ir_imm(2)));
+    })
+
+    TEST("select less than or equal to", 1, {
+        ir_retval(jit, ir_select_le(jit, ir_imm(3), ir_imm(3), ir_imm(1), ir_imm(2)));
+    })
+
+    TEST("select not less than or equal to", 2, {
+        ir_retval(jit, ir_select_le(jit, ir_imm(4), ir_imm(3), ir_imm(1), ir_imm(2)));
+    })
+
+    TEST("select less than", 1, {
+        ir_retval(jit, ir_select_lt(jit, ir_imm(3), ir_imm(4), ir_imm(1), ir_imm(2)));
+    })
+
+    TEST("select not less than", 2, {
+        ir_retval(jit, ir_select_lt(jit, ir_imm(3), ir_imm(3), ir_imm(1), ir_imm(2)));
+    })
+
+    #undef TEST
+    printf("Backend tests done\n");
+}
+
+void test_backend_performance()
+{
+    printf("Running backend performance tests\n");
+
+    codeblock_t codeblock;
+    codeblock_t* cb = &codeblock;
+
+    uint8_t* mem_block = alloc_exec_mem(20 * 1024 * 1024);
+    cb_init(cb, mem_block, 20 * 1024 * 1024);
+    cb_set_pos(cb, 0);
+
+    jitstate_t jitstate;
+    jitstate_t* jit = &jitstate;
+
+    #define TEST(NAME, EXPECTED, BODY) \
+        jitstate = (jitstate_t){ 0, 0, 0 }; \
+        BODY \
+        ir_alloc_regs(jit); \
+        ir_peephole_opt(jit); \
+        ir_gen_x86(cb, jit); \
+        ir_jit_clear(jit);
+
+    clock_t start_ticks = clock();
+
+    // Time to 5MB
+    while (cb->write_pos < 10 * 1024 * 1024)
+    {
+        TEST("and", 4, {
+            ir_opnd_t opnd0 = ir_add(jit, ir_imm(2), ir_imm(3));
+            ir_opnd_t opnd1 = ir_sub(jit, ir_imm(18), ir_imm(4));
+            ir_retval(jit, ir_and(jit, opnd0, opnd1));
+        });
+
+        TEST("jump equal", 2, {
+            ir_opnd_t label = ir_label_opnd((char *) "label");
+            ir_jump_eq(jit, ir_imm(3), ir_imm(3), label);
+            ir_retval(jit, ir_imm(1));
+            ir_label(jit, label);
+            ir_retval(jit, ir_imm(2));
+        });
+
+        TEST("jump not equal", 2, {
+            ir_opnd_t label = ir_label_opnd((char *) "label");
+            ir_jump_ne(jit, ir_imm(3), ir_imm(4), label);
+            ir_retval(jit, ir_imm(1));
+            ir_label(jit, label);
+            ir_retval(jit, ir_imm(2));
+        });
+
+        TEST("jump overflow", 2, {
+            ir_opnd_t label = ir_label_opnd((char *) "label");
+            ir_add(jit, ir_imm(INT64_MAX), ir_imm(1));
+            ir_jump_ovf(jit, label);
+            ir_retval(jit, ir_imm(1));
+            ir_label(jit, label);
+            ir_retval(jit, ir_imm(2));
+        })
+
+        TEST("call plain", 7, {
+            ir_retval(jit, ir_ccall(jit, ir_const_ptr((void *)&ir_test_function_plain)));
+        });
+
+        TEST("call with arguments", 7, {
+            ir_retval(jit, ir_ccall(jit, ir_const_ptr((void *)&ir_test_function_add), ir_imm(3), ir_imm(4)));
+        });
+    }
+
     #undef TEST
 
-    printf("Backend tests done\n");
+    clock_t end_ticks = clock();
+    clock_t delta_ticks = end_ticks - start_ticks;
+    float delta_seconds = (float)delta_ticks / CLOCKS_PER_SEC;
 
-    // This is a rough sketch of what codegen could look like, you can ignore/delete it
-    /*
-    ir_opnd_t side_exit = ir_code_ptr((void*)0x11ade42bc);
-
-    // Get the operands and destination from the stack
-    //ir_opnd_t arg1 = ctx_stack_pop(ctx, 1);
-    //ir_opnd_t arg0 = ctx_stack_pop(ctx, 1);
-
-    // 112de41f8:  mov	qword ptr [rdx + 0x10], 5
-    push_insn(jit, OP_MOV, opnd0, ir_imm(5));
-
-    //; guard arg0 fixnum
-    //112de42e1:  test	byte ptr [rdx - 0x10], 1
-    //112de42e5:  je	0x11ade42bc
-    push_insn(jit, OP_TEST, opnd0, ir_imm(3));
-    push_insn(jit, OP_JUMP_EQ, side_exit);
-
-    //; guard arg1 fixnum
-    //112de42eb:  test	byte ptr [rdx - 8], 1
-    //112de42ef:  je	0x11ade42bc
-    push_insn(jit, OP_TEST, opnd0, ir_imm(3));
-    push_insn(jit, OP_JUMP_EQ, side_exit);
-
-    // Value on stack - 1 (untag)
-    //112de42f5:  mov	rax, qword ptr [rdx - 0x10]
-    //112de42f9:  sub	rax, 1
-    push_insn(jit, OP_SUB, opnd0, ir_imm(3));
-
-    //112de42fd:  add	rax, qword ptr [rdx - 8]
-    //112de4301:  jo	0x11ade42bc
-    ir_opnd_t add_output = push_insn(jit, OP_ADD, opnd1, ir_imm(3));
-    push_insn(jit, OP_JUMP_OVF, side_exit);
-
-    // Write output value on stack
-    //112de4307:  mov	qword ptr [rdx - 0x10], rax
-    push_insn(jit, OP_STORE, opnd_out, add_output);
-    */
-
-    //push_insn(jit, OP_CALL, cfunc(rb_foobar), IR_EC, ir_imm(3), ir_imm(3), ir_imm(3));
+    printf("Backend performance tests done\n");
+    printf("It took %lu clicks (%f seconds).\n", delta_ticks, delta_seconds);
 }

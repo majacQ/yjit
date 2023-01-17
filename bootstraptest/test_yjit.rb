@@ -1,3 +1,25 @@
+# Check that frozen objects are respected
+assert_equal 'great', %q{
+  class Foo
+    attr_accessor :bar
+    def initialize
+      @bar = 1
+      freeze
+    end
+  end
+
+  foo = Foo.new
+
+  5.times do
+    begin
+      foo.bar = 2
+    rescue FrozenError
+    end
+  end
+
+  foo.bar == 1 ? "great" : "NG"
+}
+
 # Check that global variable set works
 assert_equal 'string', %q{
   def foo
@@ -439,6 +461,29 @@ assert_equal '7', %q{
 
     foo(4)
     foo(4)[1]
+}
+
+# Method redefinition while the method is on the stack
+assert_equal '[777, 1]', %q{
+    def foo
+        redef()
+        777
+    end
+
+    def redef
+        # Redefine the global foo
+        eval("def foo; 1; end", TOPLEVEL_BINDING)
+
+        # Collect dead code
+        GC.stress = true
+        GC.start
+
+        # But we will return to the original foo,
+        # which remains alive because it's on the stack
+    end
+
+    # Must produce [777, 1]
+    [foo, foo]
 }
 
 # Test for GC safety. Don't invalidate dead iseqs.
@@ -1165,6 +1210,18 @@ assert_equal 'foo123', %q{
   make_str("foo", 123)
 }
 
+# test invokebuiltin as used in struct assignment
+assert_equal '123', %q{
+  def foo(obj)
+    obj.foo = 123
+  end
+
+  struct = Struct.new(:foo)
+  obj = struct.new
+  foo(obj)
+  foo(obj)
+}
+
 # test invokebuiltin_delegate as used inside Dir.open
 assert_equal '.', %q{
   def foo(path)
@@ -1419,6 +1476,85 @@ assert_equal '[:B, [:B, :m]]', %q{
 
   ins.singleton_class.define_method(:bar, B.instance_method(:foo))
   ins.bar
+}
+
+# invokesuper changed ancestor
+assert_equal '[:A, [:M, :B]]', %q{
+  class B
+    def foo
+      :B
+    end
+  end
+
+  class A < B
+    def foo
+      [:A, super]
+    end
+  end
+
+  module M
+    def foo
+      [:M, super]
+    end
+  end
+
+  ins = A.new
+  ins.foo
+  ins.foo
+  A.include(M)
+  ins.foo
+}
+
+# invokesuper changed ancestor via prepend
+assert_equal '[:A, [:M, :B]]', %q{
+  class B
+    def foo
+      :B
+    end
+  end
+
+  class A < B
+    def foo
+      [:A, super]
+    end
+  end
+
+  module M
+    def foo
+      [:M, super]
+    end
+  end
+
+  ins = A.new
+  ins.foo
+  ins.foo
+  B.prepend(M)
+  ins.foo
+}
+
+# invokesuper replaced method
+assert_equal '[:A, :Btwo]', %q{
+  class B
+    def foo
+      :B
+    end
+  end
+
+  class A < B
+    def foo
+      [:A, super]
+    end
+  end
+
+  ins = A.new
+  ins.foo
+  ins.foo
+  class B
+    def foo
+      :Btwo
+    end
+  end
+  ins.foo
 }
 
 # Call to fixnum
@@ -1825,4 +1961,60 @@ assert_equal '42', %q{
   tp.enable
 
   ractor.take
+}
+
+# Test equality with changing types
+assert_equal '[true, false, false, false]', %q{
+  def eq(a, b)
+    a == b
+  end
+
+  [
+    eq("foo", "foo"),
+    eq("foo", "bar"),
+    eq(:foo, "bar"),
+    eq("foo", :bar)
+  ]
+}
+
+# Redefined String eq
+assert_equal 'true', %q{
+  class String
+    def ==(other)
+      true
+    end
+  end
+
+  def eq(a, b)
+    a == b
+  end
+
+  eq("foo", "bar")
+  eq("foo", "bar")
+}
+
+# Redefined Integer eq
+assert_equal 'true', %q{
+  class Integer
+    def ==(other)
+      true
+    end
+  end
+
+  def eq(a, b)
+    a == b
+  end
+
+  eq(1, 2)
+  eq(1, 2)
+}
+
+# aset on array with invalid key
+assert_normal_exit %q{
+  def foo(arr)
+    arr[:foo] = 123
+  end
+
+  foo([1]) rescue nil
+  foo([1]) rescue nil
 }

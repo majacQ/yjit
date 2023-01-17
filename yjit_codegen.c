@@ -52,11 +52,34 @@ typedef rb_darray(struct codepage_patch) patch_array_t;
 
 static patch_array_t global_inval_patches = NULL;
 
-// The number of bytes counting from the beginning of the inline code block
-// that should not be changed. After patching for global invalidation, no one
-// should make changes to the invalidated code region anymore. This is used to
-// break out of invalidation race when there are multiple ractors.
-uint32_t yjit_codepage_frozen_bytes = 0;
+// Allocate a new code page
+void
+yjit_new_code_page(void)
+{
+    // Allocate a new code page
+    VALUE new_code_page = rb_yjit_code_page_alloc();
+    code_page_t *code_page = rb_yjit_code_page_unwrap(new_code_page);
+
+    // If the new page isn't the first code page
+    if (yjit_cur_code_page != Qfalse) {
+        assert (cb && cb->write_pos < cb->mem_size - 20);
+
+        // Jump to the new code page
+        jmp_ptr(cb, code_page->mem_block + SIZEOF_VALUE);
+    }
+
+    // Map the inline code block
+    cb = &block;
+    rb_yjit_get_cb(cb, code_page->mem_block);
+    RUBY_ASSERT(cb->mem_block);
+
+    // Map the outlined code block
+    ocb = &outline_block;
+    rb_yjit_get_ocb(ocb, code_page->mem_block);
+    RUBY_ASSERT(ocb->mem_block);
+
+    yjit_cur_code_page = new_code_page;
+}
 
 // Print the current source location for debugging purposes
 RBIMPL_ATTR_MAYBE_UNUSED()
@@ -68,6 +91,16 @@ jit_print_loc(jitstate_t* jit, const char* msg)
     VALUE path = rb_iseq_path(jit->iseq);
     RSTRING_GETMEM(path, ptr, len);
     fprintf(stderr, "%s %.*s:%u\n", msg, (int)len, ptr, rb_iseq_line_no(jit->iseq, jit->insn_idx));
+}
+
+// dump an object for debugging purposes
+RBIMPL_ATTR_MAYBE_UNUSED()
+static void
+jit_obj_info_dump(codeblock_t *cb, x86opnd_t opnd) {
+    push_regs(cb);
+    mov(cb, C_ARG_REGS[0], opnd);
+    call_ptr(cb, REG0, (void *)rb_obj_info_dump);
+    pop_regs(cb);
 }
 
 // Get the current instruction's opcode
@@ -102,10 +135,10 @@ jit_mov_gc_ptr(jitstate_t* jit, codeblock_t* cb, x86opnd_t reg, VALUE ptr)
     mov(cb, reg, const_ptr_opnd((void*)ptr));
 
     // The pointer immediate is encoded as the last part of the mov written out
-    uint32_t ptr_offset = cb->write_pos - sizeof(VALUE);
+    uint8_t* ptr_to_value = cb_get_write_ptr(cb) - sizeof(VALUE);
 
     if (!SPECIAL_CONST_P(ptr)) {
-        if (!rb_darray_append(&jit->block->gc_object_offsets, ptr_offset)) {
+        if (!rb_darray_append(&jit->block->gc_object_offsets, ptr_to_value)) {
             rb_bug("allocation failed");
         }
     }
@@ -142,6 +175,7 @@ jit_peek_at_self(jitstate_t *jit, ctx_t *ctx)
     return jit->ec->cfp->self;
 }
 
+RBIMPL_ATTR_MAYBE_UNUSED()
 static VALUE
 jit_peek_at_local(jitstate_t *jit, ctx_t *ctx, int n)
 {
@@ -192,7 +226,7 @@ jit_prepare_routine_call(jitstate_t *jit, ctx_t *ctx, x86opnd_t scratch_reg)
 }
 
 // Record the current codeblock write position for rewriting into a jump into
-// the outline block later. Used to implement global code invalidation.
+// the outlined block later. Used to implement global code invalidation.
 static void
 record_global_inval_patch(const codeblock_t *cb, uint32_t outline_block_target_pos)
 {
@@ -202,8 +236,7 @@ record_global_inval_patch(const codeblock_t *cb, uint32_t outline_block_target_p
 
 static bool jit_guard_known_klass(jitstate_t *jit, ctx_t* ctx, VALUE known_klass, insn_opnd_t insn_opnd, VALUE sample_instance, const int max_chain_depth, uint8_t *side_exit);
 
-#if RUBY_DEBUG
-# define YJIT_STATS 1
+#if YJIT_STATS
 
 // Add a comment at the current position in the code block
 static void
@@ -289,14 +322,11 @@ verify_ctx(jitstate_t *jit, ctx_t *ctx)
 }
 
 #else
-#ifndef YJIT_STATS
-#define YJIT_STATS 0
-#endif // ifndef YJIT_STATS
 
 #define ADD_COMMENT(cb, comment) ((void)0)
 #define verify_ctx(jit, ctx) ((void)0)
 
-#endif // if RUBY_DEBUG
+#endif // if YJIT_STATS
 
 #if YJIT_STATS
 
@@ -326,14 +356,12 @@ _counted_side_exit(uint8_t *existing_side_exit, int64_t *counter)
     return start;
 }
 
-
 #else
 
 #define GEN_COUNTER_INC(cb, counter_name) ((void)0)
 #define COUNTED_EXIT(side_exit, counter_name) side_exit
 
 #endif // if YJIT_STATS
-
 
 // Generate an exit to return to the interpreter
 static uint32_t
@@ -351,10 +379,7 @@ yjit_gen_exit(VALUE *exit_pc, ctx_t *ctx, codeblock_t *cb)
         mov(cb, member_opnd(REG_CFP, rb_control_frame_t, sp), REG_SP);
     }
 
-    // Update the CFP on the EC
-    mov(cb, member_opnd(REG_EC, rb_execution_context_t, cfp), REG_CFP);
-
-    // Put PC into the return register, which the post call bytes dispatches to
+    // Update CFP->PC
     mov(cb, RAX, const_ptr_opnd(exit_pc));
     mov(cb, member_opnd(REG_CFP, rb_control_frame_t, pc), RAX);
 
@@ -382,8 +407,13 @@ yjit_gen_leave_exit(codeblock_t *cb)
 {
     uint8_t *code_ptr = cb_get_ptr(cb, cb->write_pos);
 
+  <<<<<<< block-wrappers
     // Note, gen_leave() fully reconstructs interpreter state and leaves
     // the return value in RAX before coming here.
+  =======
+    // Note, gen_leave() fully reconstructs interpreter state and leaves the
+    // return value in RAX before coming here.
+  >>>>>>> code_pages_the_sequel
 
     // Every exit to the interpreter should be counted
     GEN_COUNTER_INC(cb, leave_interp_return);
@@ -397,12 +427,27 @@ yjit_gen_leave_exit(codeblock_t *cb)
     return code_ptr;
 }
 
-// A shorthand for generating an exit in the outline block
+// :side-exit:
+// Get an exit for the current instruction in the outlined block. The code
+// for each instruction often begins with several guards before proceeding
+// to do work. When guards fail, an option we have is to exit to the
+// interpreter at an instruction boundary. The piece of code that takes
+// care of reconstructing interpreter state and exiting out of generated
+// code is called the side exit.
+//
+// No guards change the logic for reconstructing interpreter state at the
+// moment, so there is one unique side exit for each context. Note that
+// it's incorrect to jump to the side exit after any ctx stack push/pop operations
+// since they change the logic required for reconstructing interpreter state.
 static uint8_t *
 yjit_side_exit(jitstate_t *jit, ctx_t *ctx)
 {
-    uint32_t pos = yjit_gen_exit(jit->pc, ctx, ocb);
-    return cb_get_ptr(ocb, pos);
+    if (!jit->side_exit_for_pc) {
+        uint32_t pos = yjit_gen_exit(jit->pc, ctx, ocb);
+        jit->side_exit_for_pc = cb_get_ptr(ocb, pos);
+    }
+
+    return jit->side_exit_for_pc;
 }
 
 // Generate a runtime guard that ensures the PC is at the start of the iseq,
@@ -452,7 +497,6 @@ full_cfunc_return(rb_execution_context_t *ec, VALUE return_value)
     RUBY_ASSERT_ALWAYS(me->def->type == VM_METHOD_TYPE_CFUNC);
 
     // CHECK_CFP_CONSISTENCY("full_cfunc_return"); TODO revive this
-
 
     // Pop the C func's frame and fire the c_return TracePoint event
     // Note that this is the same order as vm_call_cfunc_with_frame().
@@ -579,6 +623,7 @@ jit_jump_to_next_insn(jitstate_t *jit, const ctx_t *current_context)
 
     // Generate the jump instruction
     gen_direct_jump(
+        cb,
         jit->block,
         &reset_depth,
         jump_block
@@ -601,14 +646,12 @@ yjit_gen_block(block_t *block, rb_execution_context_t *ec)
     uint32_t insn_idx = block->blockid.idx;
     const uint32_t starting_insn_idx = insn_idx;
 
-    // NOTE: if we are ever deployed in production, we
-    // should probably just log an error and return NULL here,
-    // so we can fail more gracefully
-    if (cb->write_pos + 1024 >= cb->mem_size) {
-        rb_bug("out of executable memory");
-    }
-    if (ocb->write_pos + 1024 >= ocb->mem_size) {
-        rb_bug("out of executable memory (outlined block)");
+    // If we don't have enough space for this block
+    if (cb->write_pos + 1024 >= cb->mem_size ||
+        ocb->write_pos + 1024 >= ocb->mem_size) {
+
+        // Allocate a new code page
+        yjit_new_code_page();
     }
 
     // Initialize a JIT state object
@@ -619,7 +662,7 @@ yjit_gen_block(block_t *block, rb_execution_context_t *ec)
     };
 
     // Mark the start position of the block
-    block->start_pos = cb->write_pos;
+    block->start_pos = cb_get_write_ptr(cb);
 
     // For each instruction to compile
     for (;;) {
@@ -637,8 +680,9 @@ yjit_gen_block(block_t *block, rb_execution_context_t *ec)
 
         // Set the current instruction
         jit.insn_idx = insn_idx;
-        jit.pc = pc;
         jit.opcode = opcode;
+        jit.pc = pc;
+        jit.side_exit_for_pc = NULL;
 
         // If previous instruction requested to record the boundary
         if (jit.record_boundary_patch_point) {
@@ -676,7 +720,7 @@ yjit_gen_block(block_t *block, rb_execution_context_t *ec)
         ADD_COMMENT(cb, insn_name(opcode));
 
         // Call the code generation function
-        codegen_status_t status = gen_fn(&jit, ctx);
+        codegen_status_t status = gen_fn(&jit, ctx, cb);
 
         // For now, reset the chain depth after each instruction as only the
         // first instruction in the block can concern itself with the depth.
@@ -702,7 +746,7 @@ yjit_gen_block(block_t *block, rb_execution_context_t *ec)
     }
 
     // Mark the end position of the block
-    block->end_pos = cb->write_pos;
+    block->end_pos = cb_get_write_ptr(cb);
 
     // Store the index of the last instruction in the block
     block->end_idx = insn_idx;
@@ -722,15 +766,17 @@ yjit_gen_block(block_t *block, rb_execution_context_t *ec)
     }
 }
 
+static codegen_status_t gen_opt_send_without_block(jitstate_t* jit, ctx_t* ctx, codeblock_t* cb);
+
 static codegen_status_t
-gen_nop(jitstate_t* jit, ctx_t* ctx)
+gen_nop(jitstate_t* jit, ctx_t* ctx, codeblock_t* cb)
 {
     // Do nothing
     return YJIT_KEEP_COMPILING;
 }
 
 static codegen_status_t
-gen_dup(jitstate_t* jit, ctx_t* ctx)
+gen_dup(jitstate_t* jit, ctx_t* ctx, codeblock_t* cb)
 {
     // Get the top value and its type
     x86opnd_t dup_val = ctx_stack_pop(ctx, 0);
@@ -746,7 +792,7 @@ gen_dup(jitstate_t* jit, ctx_t* ctx)
 
 // duplicate stack top n elements
 static codegen_status_t
-gen_dupn(jitstate_t* jit, ctx_t* ctx)
+gen_dupn(jitstate_t* jit, ctx_t* ctx, codeblock_t* cb)
 {
     rb_num_t n = (rb_num_t)jit_get_arg(jit, 0);
 
@@ -773,7 +819,7 @@ gen_dupn(jitstate_t* jit, ctx_t* ctx)
 
 // Swap top 2 stack entries
 static codegen_status_t
-gen_swap(jitstate_t* jit, ctx_t* ctx)
+gen_swap(jitstate_t* jit, ctx_t* ctx, codeblock_t* cb)
 {
     x86opnd_t opnd0 = ctx_stack_opnd(ctx, 0);
     x86opnd_t opnd1 = ctx_stack_opnd(ctx, 1);
@@ -793,7 +839,7 @@ gen_swap(jitstate_t* jit, ctx_t* ctx)
 
 // set Nth stack entry to stack top
 static codegen_status_t
-gen_setn(jitstate_t* jit, ctx_t* ctx)
+gen_setn(jitstate_t* jit, ctx_t* ctx, codeblock_t* cb)
 {
     rb_num_t n = (rb_num_t)jit_get_arg(jit, 0);
 
@@ -811,7 +857,7 @@ gen_setn(jitstate_t* jit, ctx_t* ctx)
 
 // get nth stack value, then push it
 static codegen_status_t
-gen_topn(jitstate_t* jit, ctx_t* ctx)
+gen_topn(jitstate_t* jit, ctx_t* ctx, codeblock_t* cb)
 {
     int32_t n = (int32_t)jit_get_arg(jit, 0);
 
@@ -827,7 +873,7 @@ gen_topn(jitstate_t* jit, ctx_t* ctx)
 }
 
 static codegen_status_t
-gen_pop(jitstate_t* jit, ctx_t* ctx)
+gen_pop(jitstate_t* jit, ctx_t* ctx, codeblock_t* cb)
 {
     // Decrement SP
     ctx_stack_pop(ctx, 1);
@@ -836,7 +882,7 @@ gen_pop(jitstate_t* jit, ctx_t* ctx)
 
 // Pop n values off the stack
 static codegen_status_t
-gen_adjuststack(jitstate_t* jit, ctx_t* ctx)
+gen_adjuststack(jitstate_t* jit, ctx_t* ctx, codeblock_t* cb)
 {
     rb_num_t n = (rb_num_t)jit_get_arg(jit, 0);
     ctx_stack_pop(ctx, n);
@@ -845,7 +891,7 @@ gen_adjuststack(jitstate_t* jit, ctx_t* ctx)
 
 // new array initialized from top N values
 static codegen_status_t
-gen_newarray(jitstate_t* jit, ctx_t* ctx)
+gen_newarray(jitstate_t* jit, ctx_t* ctx, codeblock_t* cb)
 {
     rb_num_t n = (rb_num_t)jit_get_arg(jit, 0);
 
@@ -869,7 +915,7 @@ gen_newarray(jitstate_t* jit, ctx_t* ctx)
 
 // dup array
 static codegen_status_t
-gen_duparray(jitstate_t* jit, ctx_t* ctx)
+gen_duparray(jitstate_t* jit, ctx_t* ctx, codeblock_t* cb)
 {
     VALUE ary = jit_get_arg(jit, 0);
 
@@ -890,7 +936,7 @@ VALUE rb_vm_splat_array(VALUE flag, VALUE ary);
 
 // call to_a on the array on the stack
 static codegen_status_t
-gen_splatarray(jitstate_t* jit, ctx_t* ctx)
+gen_splatarray(jitstate_t* jit, ctx_t* ctx, codeblock_t* cb)
 {
     VALUE flag = (VALUE) jit_get_arg(jit, 0);
 
@@ -907,6 +953,28 @@ gen_splatarray(jitstate_t* jit, ctx_t* ctx)
     call_ptr(cb, REG1, (void *) rb_vm_splat_array);
 
     x86opnd_t stack_ret = ctx_stack_push(ctx, TYPE_ARRAY);
+    mov(cb, stack_ret, RAX);
+
+    return YJIT_KEEP_COMPILING;
+}
+
+// new range initialized from top 2 values
+static codegen_status_t
+gen_newrange(jitstate_t* jit, ctx_t* ctx, codeblock_t* cb)
+{
+    rb_num_t flag = (rb_num_t)jit_get_arg(jit, 0);
+
+    // rb_range_new() allocates and can raise
+    jit_prepare_routine_call(jit, ctx, REG0);
+
+    // val = rb_range_new(low, high, (int)flag);
+    mov(cb, C_ARG_REGS[0], ctx_stack_opnd(ctx, 1));
+    mov(cb, C_ARG_REGS[1], ctx_stack_opnd(ctx, 0));
+    mov(cb, C_ARG_REGS[2], imm_opnd(flag));
+    call_ptr(cb, REG0, (void *)rb_range_new);
+
+    ctx_stack_pop(ctx, 2);
+    x86opnd_t stack_ret = ctx_stack_push(ctx, TYPE_HEAP);
     mov(cb, stack_ret, RAX);
 
     return YJIT_KEEP_COMPILING;
@@ -943,7 +1011,7 @@ guard_object_is_array(codeblock_t *cb, x86opnd_t object_opnd, x86opnd_t flags_op
 
 // push enough nils onto the stack to fill out an array
 static codegen_status_t
-gen_expandarray(jitstate_t* jit, ctx_t* ctx)
+gen_expandarray(jitstate_t* jit, ctx_t* ctx, codeblock_t* cb)
 {
     int flag = (int) jit_get_arg(jit, 1);
 
@@ -963,8 +1031,19 @@ gen_expandarray(jitstate_t* jit, ctx_t* ctx)
 
     // num is the number of requested values. If there aren't enough in the
     // array then we're going to push on nils.
-    rb_num_t num = (rb_num_t) jit_get_arg(jit, 0);
+    int num = (int)jit_get_arg(jit, 0);
+    val_type_t array_type = ctx_get_opnd_type(ctx, OPND_STACK(0));
     x86opnd_t array_opnd = ctx_stack_pop(ctx, 1);
+
+    if (array_type.type == ETYPE_NIL) {
+        // special case for a, b = nil pattern
+        // push N nils onto the stack
+        for (int i = 0; i < num; i++) {
+            x86opnd_t push = ctx_stack_push(ctx, TYPE_NIL);
+            mov(cb, push, imm_opnd(Qnil));
+        }
+        return YJIT_KEEP_COMPILING;
+    }
 
     // Move the array from the stack into REG0 and check that it's an array.
     mov(cb, REG0, array_opnd);
@@ -1014,7 +1093,7 @@ gen_expandarray(jitstate_t* jit, ctx_t* ctx)
 
 // new hash initialized from top N values
 static codegen_status_t
-gen_newhash(jitstate_t* jit, ctx_t* ctx)
+gen_newhash(jitstate_t* jit, ctx_t* ctx, codeblock_t* cb)
 {
     rb_num_t n = (rb_num_t)jit_get_arg(jit, 0);
 
@@ -1035,7 +1114,7 @@ gen_newhash(jitstate_t* jit, ctx_t* ctx)
 }
 
 static codegen_status_t
-gen_putnil(jitstate_t* jit, ctx_t* ctx)
+gen_putnil(jitstate_t* jit, ctx_t* ctx, codeblock_t* cb)
 {
     // Write constant at SP
     x86opnd_t stack_top = ctx_stack_push(ctx, TYPE_NIL);
@@ -1044,7 +1123,7 @@ gen_putnil(jitstate_t* jit, ctx_t* ctx)
 }
 
 static codegen_status_t
-gen_putobject(jitstate_t* jit, ctx_t* ctx)
+gen_putobject(jitstate_t* jit, ctx_t* ctx, codeblock_t* cb)
 {
     VALUE arg = jit_get_arg(jit, 0);
 
@@ -1088,7 +1167,7 @@ gen_putobject(jitstate_t* jit, ctx_t* ctx)
 }
 
 static codegen_status_t
-gen_putstring(jitstate_t* jit, ctx_t* ctx)
+gen_putstring(jitstate_t* jit, ctx_t* ctx, codeblock_t* cb)
 {
     VALUE put_val = jit_get_arg(jit, 0);
 
@@ -1106,7 +1185,7 @@ gen_putstring(jitstate_t* jit, ctx_t* ctx)
 }
 
 static codegen_status_t
-gen_putobject_int2fix(jitstate_t* jit, ctx_t* ctx)
+gen_putobject_int2fix(jitstate_t* jit, ctx_t* ctx, codeblock_t* cb)
 {
     int opcode = jit_get_opcode(jit);
     int cst_val = (opcode == BIN(putobject_INT2FIX_0_))? 0:1;
@@ -1119,7 +1198,7 @@ gen_putobject_int2fix(jitstate_t* jit, ctx_t* ctx)
 }
 
 static codegen_status_t
-gen_putself(jitstate_t* jit, ctx_t* ctx)
+gen_putself(jitstate_t* jit, ctx_t* ctx, codeblock_t* cb)
 {
     // Load self from CFP
     mov(cb, REG0, member_opnd(REG_CFP, rb_control_frame_t, self));
@@ -1132,7 +1211,7 @@ gen_putself(jitstate_t* jit, ctx_t* ctx)
 }
 
 static codegen_status_t
-gen_putspecialobject(jitstate_t* jit, ctx_t* ctx)
+gen_putspecialobject(jitstate_t* jit, ctx_t* ctx, codeblock_t* cb)
 {
     enum vm_special_object_type type = (enum vm_special_object_type)jit_get_arg(jit, 0);
 
@@ -1145,6 +1224,22 @@ gen_putspecialobject(jitstate_t* jit, ctx_t* ctx)
         // TODO: implement for VM_SPECIAL_OBJECT_CBASE and
         // VM_SPECIAL_OBJECT_CONST_BASE
         return YJIT_CANT_COMPILE;
+    }
+}
+
+// Get EP at level from CFP
+static void
+gen_get_ep(codeblock_t *cb, x86opnd_t reg, uint32_t level)
+{
+    // Load environment pointer EP from CFP
+    mov(cb, reg, member_opnd(REG_CFP, rb_control_frame_t, ep));
+
+    while (level--) {
+        // Get the previous EP from the current EP
+        // See GET_PREV_EP(ep) macro
+        // VALUE* prev_ep = ((VALUE *)((ep)[VM_ENV_DATA_INDEX_SPECVAL] & ~0x03))
+        mov(cb, reg, mem_opnd(64, REG0, SIZEOF_VALUE * VM_ENV_DATA_INDEX_SPECVAL));
+        and(cb, reg, imm_opnd(~0x03));
     }
 }
 
@@ -1161,15 +1256,15 @@ slot_to_local_idx(const rb_iseq_t *iseq, int32_t slot_idx)
 }
 
 static codegen_status_t
-gen_getlocal_wc0(jitstate_t* jit, ctx_t* ctx)
+gen_getlocal_wc0(jitstate_t* jit, ctx_t* ctx, codeblock_t* cb)
 {
     // Compute the offset from BP to the local
     int32_t slot_idx = (int32_t)jit_get_arg(jit, 0);
     const int32_t offs = -(SIZEOF_VALUE * slot_idx);
     uint32_t local_idx = slot_to_local_idx(jit->iseq, slot_idx);
 
-    // Load environment pointer EP from CFP
-    mov(cb, REG0, member_opnd(REG_CFP, rb_control_frame_t, ep));
+    // Load environment pointer EP (level 0) from CFP
+    gen_get_ep(cb, REG0, 0);
 
     // Load the local from the EP
     mov(cb, REG0, mem_opnd(64, REG0, offs));
@@ -1184,16 +1279,7 @@ gen_getlocal_wc0(jitstate_t* jit, ctx_t* ctx)
 static codegen_status_t
 gen_getlocal_generic(ctx_t* ctx, uint32_t local_idx, uint32_t level)
 {
-    // Load environment pointer EP from CFP
-    mov(cb, REG0, member_opnd(REG_CFP, rb_control_frame_t, ep));
-
-    while (level--) {
-        // Get the previous EP from the current EP
-        // See GET_PREV_EP(ep) macro
-        // VALUE* prev_ep = ((VALUE *)((ep)[VM_ENV_DATA_INDEX_SPECVAL] & ~0x03))
-        mov(cb, REG0, mem_opnd(64, REG0, SIZEOF_VALUE * VM_ENV_DATA_INDEX_SPECVAL));
-        and(cb, REG0, imm_opnd(~0x03));
-    }
+    gen_get_ep(cb, REG0, level);
 
     // Load the local from the block
     // val = *(vm_get_ep(GET_EP(), level) - idx);
@@ -1208,7 +1294,7 @@ gen_getlocal_generic(ctx_t* ctx, uint32_t local_idx, uint32_t level)
 }
 
 static codegen_status_t
-gen_getlocal(jitstate_t* jit, ctx_t* ctx)
+gen_getlocal(jitstate_t* jit, ctx_t* ctx, codeblock_t* cb)
 {
     int32_t idx = (int32_t)jit_get_arg(jit, 0);
     int32_t level = (int32_t)jit_get_arg(jit, 1);
@@ -1216,14 +1302,14 @@ gen_getlocal(jitstate_t* jit, ctx_t* ctx)
 }
 
 static codegen_status_t
-gen_getlocal_wc1(jitstate_t* jit, ctx_t* ctx)
+gen_getlocal_wc1(jitstate_t* jit, ctx_t* ctx, codeblock_t* cb)
 {
     int32_t idx = (int32_t)jit_get_arg(jit, 0);
     return gen_getlocal_generic(ctx, idx, 1);
 }
 
 static codegen_status_t
-gen_setlocal_wc0(jitstate_t* jit, ctx_t* ctx)
+gen_setlocal_wc0(jitstate_t* jit, ctx_t* ctx, codeblock_t* cb)
 {
     /*
     vm_env_write(const VALUE *ep, int index, VALUE v)
@@ -1241,8 +1327,8 @@ gen_setlocal_wc0(jitstate_t* jit, ctx_t* ctx)
     int32_t slot_idx = (int32_t)jit_get_arg(jit, 0);
     uint32_t local_idx = slot_to_local_idx(jit->iseq, slot_idx);
 
-    // Load environment pointer EP from CFP
-    mov(cb, REG0, member_opnd(REG_CFP, rb_control_frame_t, ep));
+    // Load environment pointer EP (level 0) from CFP
+    gen_get_ep(cb, REG0, 0);
 
     // flags & VM_ENV_FLAG_WB_REQUIRED
     x86opnd_t flags_opnd = mem_opnd(64, REG0, sizeof(VALUE) * VM_ENV_DATA_INDEX_FLAGS);
@@ -1267,6 +1353,48 @@ gen_setlocal_wc0(jitstate_t* jit, ctx_t* ctx)
     mov(cb, mem_opnd(64, REG0, offs), REG1);
 
     return YJIT_KEEP_COMPILING;
+}
+
+static codegen_status_t
+gen_setlocal_generic(jitstate_t *jit, ctx_t* ctx, uint32_t local_idx, uint32_t level)
+{
+    // Load environment pointer EP at level
+    gen_get_ep(cb, REG0, level);
+
+    // flags & VM_ENV_FLAG_WB_REQUIRED
+    x86opnd_t flags_opnd = mem_opnd(64, REG0, sizeof(VALUE) * VM_ENV_DATA_INDEX_FLAGS);
+    test(cb, flags_opnd, imm_opnd(VM_ENV_FLAG_WB_REQUIRED));
+
+    // Create a size-exit to fall back to the interpreter
+    uint8_t *side_exit = yjit_side_exit(jit, ctx);
+
+    // if (flags & VM_ENV_FLAG_WB_REQUIRED) != 0
+    jnz_ptr(cb, side_exit);
+
+    // Pop the value to write from the stack
+    x86opnd_t stack_top = ctx_stack_pop(ctx, 1);
+    mov(cb, REG1, stack_top);
+
+    // Write the value at the environment pointer
+    const int32_t offs = -(SIZEOF_VALUE * local_idx);
+    mov(cb, mem_opnd(64, REG0, offs), REG1);
+
+    return YJIT_KEEP_COMPILING;
+}
+
+static codegen_status_t
+gen_setlocal(jitstate_t* jit, ctx_t* ctx, codeblock_t* cb)
+{
+    int32_t idx = (int32_t)jit_get_arg(jit, 0);
+    int32_t level = (int32_t)jit_get_arg(jit, 1);
+    return gen_setlocal_generic(jit, ctx, idx, level);
+}
+
+static codegen_status_t
+gen_setlocal_wc1(jitstate_t* jit, ctx_t* ctx, codeblock_t* cb)
+{
+    int32_t idx = (int32_t)jit_get_arg(jit, 0);
+    return gen_setlocal_generic(jit, ctx, idx, 1);
 }
 
 // Check that `self` is a pointer to an object on the GC heap
@@ -1374,6 +1502,8 @@ jit_chain_guard(enum jcc_kinds jcc, jitstate_t *jit, const ctx_t *ctx, uint8_t d
         deeper.chain_depth++;
 
         gen_branch(
+            cb,
+            ocb,
             jit->block,
             ctx,
             (blockid_t) { jit->iseq, jit->insn_idx },
@@ -1396,118 +1526,56 @@ enum {
     SEND_MAX_DEPTH = 5,           // up to 5 different classes
 };
 
-/*
+static uint32_t
+yjit_force_iv_index(VALUE comptime_receiver, VALUE klass, ID name)
+{
+    ID id = name;
+    struct rb_iv_index_tbl_entry *ent;
+    struct st_table *iv_index_tbl = ROBJECT_IV_INDEX_TBL(comptime_receiver);
+
+    // Make sure there is a mapping for this ivar in the index table
+    if (!iv_index_tbl || !rb_iv_index_tbl_lookup(iv_index_tbl, id, &ent)) {
+        rb_ivar_set(comptime_receiver, id, Qundef);
+        iv_index_tbl = ROBJECT_IV_INDEX_TBL(comptime_receiver);
+        RUBY_ASSERT(iv_index_tbl);
+        // Redo the lookup
+        RUBY_ASSERT_ALWAYS(rb_iv_index_tbl_lookup(iv_index_tbl, id, &ent));
+    }
+
+    return ent->index;
+}
+
+VALUE rb_vm_set_ivar_idx(VALUE obj, uint32_t idx, VALUE val);
+
 // Codegen for setting an instance variable.
 // Preconditions:
 //   - receiver is in REG0
 //   - receiver has the same class as CLASS_OF(comptime_receiver)
 //   - no stack push or pops to ctx since the entry to the codegen of the instruction being compiled
 static codegen_status_t
-gen_set_ivar(jitstate_t *jit, ctx_t *ctx, const int max_chain_depth, VALUE comptime_receiver, ID ivar_name, insn_opnd_t reg0_opnd, uint8_t *side_exit)
+gen_set_ivar(jitstate_t *jit, ctx_t *ctx, VALUE recv, VALUE klass, ID ivar_name)
 {
-    VALUE comptime_val_klass = CLASS_OF(comptime_receiver);
-    const ctx_t starting_context = *ctx; // make a copy for use with jit_chain_guard
+    // Save the PC and SP because the callee may allocate
+    // Note that this modifies REG_SP, which is why we do it first
+    jit_prepare_routine_call(jit, ctx, REG0);
 
-    // If the class uses the default allocator, instances should all be T_OBJECT
-    // NOTE: This assumes nobody changes the allocator of the class after allocation.
-    //       Eventually, we can encode whether an object is T_OBJECT or not
-    //       inside object shapes.
-    if (rb_get_alloc_func(comptime_val_klass) != rb_class_allocate_instance) {
-        GEN_COUNTER_INC(cb, setivar_not_object);
-        return YJIT_CANT_COMPILE;
-    }
-    RUBY_ASSERT(BUILTIN_TYPE(comptime_receiver) == T_OBJECT); // because we checked the allocator
+    // Get the operands from the stack
+    x86opnd_t val_opnd = ctx_stack_pop(ctx, 1);
+    x86opnd_t recv_opnd = ctx_stack_pop(ctx, 1);
 
-    // ID for the name of the ivar
-    ID id = ivar_name;
-    struct rb_iv_index_tbl_entry *ent;
-    struct st_table *iv_index_tbl = ROBJECT_IV_INDEX_TBL(comptime_receiver);
+    uint32_t ivar_index = yjit_force_iv_index(recv, klass, ivar_name);
 
-    // Lookup index for the ivar the instruction loads
-    if (iv_index_tbl && rb_iv_index_tbl_lookup(iv_index_tbl, id, &ent)) {
-        uint32_t ivar_index = ent->index;
+    // Call rb_vm_set_ivar_idx with the receiver, the index of the ivar, and the value
+    mov(cb, C_ARG_REGS[0], recv_opnd);
+    mov(cb, C_ARG_REGS[1], imm_opnd(ivar_index));
+    mov(cb, C_ARG_REGS[2], val_opnd);
+    call_ptr(cb, REG0, (void *)rb_vm_set_ivar_idx);
 
-        val_type_t val_type = ctx_get_opnd_type(ctx, OPND_STACK(0));
-        x86opnd_t val_to_write = ctx_stack_opnd(ctx, 0);
-        mov(cb, REG1, val_to_write);
+    x86opnd_t out_opnd = ctx_stack_push(ctx, TYPE_UNKNOWN);
+    mov(cb, out_opnd, RAX);
 
-        // Bail if the value to write is a heap object, because this needs a write barrier
-        if (!val_type.is_imm) {
-            ADD_COMMENT(cb, "guard value is immediate");
-            test(cb, REG1, imm_opnd(RUBY_IMMEDIATE_MASK));
-            jz_ptr(cb, COUNTED_EXIT(side_exit, setivar_val_heapobject));
-            ctx_upgrade_opnd_type(ctx, OPND_STACK(0), TYPE_IMM);
-        }
-
-        // Pop the value to write
-        ctx_stack_pop(ctx, 1);
-
-        // Bail if this object is frozen
-        ADD_COMMENT(cb, "guard self is not frozen");
-        x86opnd_t flags_opnd = member_opnd(REG0, struct RBasic, flags);
-        test(cb, flags_opnd, imm_opnd(RUBY_FL_FREEZE));
-        jnz_ptr(cb, COUNTED_EXIT(side_exit, setivar_frozen));
-
-        // Pop receiver if it's on the temp stack
-        if (!reg0_opnd.is_self) {
-            (void)ctx_stack_pop(ctx, 1);
-        }
-
-        // Compile time self is embedded and the ivar index lands within the object
-        if (RB_FL_TEST_RAW(comptime_receiver, ROBJECT_EMBED) && ivar_index < ROBJECT_EMBED_LEN_MAX) {
-            // See ROBJECT_IVPTR() from include/ruby/internal/core/robject.h
-
-            // Guard that self is embedded
-            // TODO: BT and JC is shorter
-            ADD_COMMENT(cb, "guard embedded setivar");
-            test(cb, flags_opnd, imm_opnd(ROBJECT_EMBED));
-            jit_chain_guard(JCC_JZ, jit, &starting_context, max_chain_depth, side_exit);
-
-            // Store the ivar on the object
-            x86opnd_t ivar_opnd = mem_opnd(64, REG0, offsetof(struct RObject, as.ary) + ivar_index * SIZEOF_VALUE);
-            mov(cb, ivar_opnd, REG1);
-
-            // Push the ivar on the stack
-            // For attr_writer we'll need to push the value on the stack
-            //x86opnd_t out_opnd = ctx_stack_push(ctx, TYPE_UNKNOWN);
-        }
-        else {
-            // Compile time value is *not* embeded.
-
-            // Guard that value is *not* embedded
-            // See ROBJECT_IVPTR() from include/ruby/internal/core/robject.h
-            ADD_COMMENT(cb, "guard extended setivar");
-            x86opnd_t flags_opnd = member_opnd(REG0, struct RBasic, flags);
-            test(cb, flags_opnd, imm_opnd(ROBJECT_EMBED));
-            jit_chain_guard(JCC_JNZ, jit, &starting_context, max_chain_depth, side_exit);
-
-            // check that the extended table is big enough
-            if (ivar_index >= ROBJECT_EMBED_LEN_MAX + 1) {
-                // Check that the slot is inside the extended table (num_slots > index)
-                ADD_COMMENT(cb, "check index in extended table");
-                x86opnd_t num_slots = mem_opnd(32, REG0, offsetof(struct RObject, as.heap.numiv));
-                cmp(cb, num_slots, imm_opnd(ivar_index));
-                jle_ptr(cb, COUNTED_EXIT(side_exit, setivar_idx_out_of_range));
-            }
-
-            // Get a pointer to the extended table
-            x86opnd_t tbl_opnd = mem_opnd(64, REG0, offsetof(struct RObject, as.heap.ivptr));
-            mov(cb, REG0, tbl_opnd);
-
-            // Write the ivar to the extended table
-            x86opnd_t ivar_opnd = mem_opnd(64, REG0, sizeof(VALUE) * ivar_index);
-            mov(cb, ivar_opnd, REG1);
-        }
-
-        // Jump to next instruction. This allows guard chains to share the same successor.
-        jit_jump_to_next_insn(jit, ctx);
-        return YJIT_END_BLOCK;
-    }
-
-    GEN_COUNTER_INC(cb, setivar_name_not_mapped);
-    return YJIT_CANT_COMPILE;
+    return YJIT_KEEP_COMPILING;
 }
-*/
 
 // Codegen for getting an instance variable.
 // Preconditions:
@@ -1566,21 +1634,7 @@ gen_get_ivar(jitstate_t *jit, ctx_t *ctx, const int max_chain_depth, VALUE compt
     jit_chain_guard(JCC_JNE, jit, &starting_context, max_chain_depth, side_exit);
     */
 
-    // ID for the name of the ivar
-    ID id = ivar_name;
-    struct rb_iv_index_tbl_entry *ent;
-    struct st_table *iv_index_tbl = ROBJECT_IV_INDEX_TBL(comptime_receiver);
-
-    // Make sure there is a mapping for this ivar in the index table
-    if (!iv_index_tbl || !rb_iv_index_tbl_lookup(iv_index_tbl, id, &ent)) {
-        rb_ivar_set(comptime_receiver, id, Qundef);
-        iv_index_tbl = ROBJECT_IV_INDEX_TBL(comptime_receiver);
-        RUBY_ASSERT(iv_index_tbl);
-        // Redo the lookup
-        RUBY_ASSERT_ALWAYS(rb_iv_index_tbl_lookup(iv_index_tbl, id, &ent));
-    }
-
-    uint32_t ivar_index = ent->index;
+    uint32_t ivar_index = yjit_force_iv_index(comptime_receiver, CLASS_OF(comptime_receiver), ivar_name);
 
     // Pop receiver if it's on the temp stack
     if (!reg0_opnd.is_self) {
@@ -1653,11 +1707,11 @@ gen_get_ivar(jitstate_t *jit, ctx_t *ctx, const int max_chain_depth, VALUE compt
 }
 
 static codegen_status_t
-gen_getinstancevariable(jitstate_t *jit, ctx_t *ctx)
+gen_getinstancevariable(jitstate_t* jit, ctx_t* ctx, codeblock_t* cb)
 {
     // Defer compilation so we can specialize on a runtime `self`
     if (!jit_at_current_insn(jit)) {
-        defer_compilation(jit->block, jit->insn_idx, ctx);
+        defer_compilation(cb, ocb, jit->block, jit->insn_idx, ctx);
         return YJIT_END_BLOCK;
     }
 
@@ -1681,7 +1735,7 @@ gen_getinstancevariable(jitstate_t *jit, ctx_t *ctx)
 void rb_vm_setinstancevariable(const rb_iseq_t *iseq, VALUE obj, ID id, VALUE val, IVC ic);
 
 static codegen_status_t
-gen_setinstancevariable(jitstate_t* jit, ctx_t* ctx)
+gen_setinstancevariable(jitstate_t* jit, ctx_t* ctx, codeblock_t* cb)
 {
     ID id = (ID)jit_get_arg(jit, 0);
     IVC ic = (IVC)jit_get_arg(jit, 1);
@@ -1702,36 +1756,12 @@ gen_setinstancevariable(jitstate_t* jit, ctx_t* ctx)
     call_ptr(cb, REG0, (void *)rb_vm_setinstancevariable);
 
     return YJIT_KEEP_COMPILING;
-
-    /*
-    // Defer compilation so we can specialize on a runtime `self`
-    if (!jit_at_current_insn(jit)) {
-        defer_compilation(jit->block, jit->insn_idx, ctx);
-        return YJIT_END_BLOCK;
-    }
-
-    ID ivar_name = (ID)jit_get_arg(jit, 0);
-
-    VALUE comptime_val = jit_peek_at_self(jit, ctx);
-    VALUE comptime_val_klass = CLASS_OF(comptime_val);
-
-    // Generate a side exit
-    uint8_t *side_exit = yjit_side_exit(jit, ctx);
-
-    // Guard that the receiver has the same class as the one from compile time.
-    mov(cb, REG0, member_opnd(REG_CFP, rb_control_frame_t, self));
-    guard_self_is_heap(cb, REG0, COUNTED_EXIT(side_exit, setivar_se_self_not_heap), ctx);
-
-    jit_guard_known_klass(jit, ctx, comptime_val_klass, OPND_SELF, GETIVAR_MAX_DEPTH, side_exit);
-
-    return gen_set_ivar(jit, ctx, GETIVAR_MAX_DEPTH, comptime_val, ivar_name, OPND_SELF, side_exit);
-    */
 }
 
 bool rb_vm_defined(rb_execution_context_t *ec, rb_control_frame_t *reg_cfp, rb_num_t op_type, VALUE obj, VALUE v);
 
 static codegen_status_t
-gen_defined(jitstate_t* jit, ctx_t* ctx)
+gen_defined(jitstate_t* jit, ctx_t* ctx, codeblock_t* cb)
 {
     rb_num_t op_type = (rb_num_t)jit_get_arg(jit, 0);
     VALUE obj = (VALUE)jit_get_arg(jit, 1);
@@ -1769,7 +1799,7 @@ gen_defined(jitstate_t* jit, ctx_t* ctx)
 }
 
 static codegen_status_t
-gen_checktype(jitstate_t* jit, ctx_t* ctx)
+gen_checktype(jitstate_t* jit, ctx_t* ctx, codeblock_t* cb)
 {
     enum ruby_value_type type_val = (enum ruby_value_type)jit_get_arg(jit, 0);
     // Only three types are emitted by compile.c
@@ -1828,7 +1858,7 @@ gen_checktype(jitstate_t* jit, ctx_t* ctx)
 }
 
 static codegen_status_t
-gen_concatstrings(jitstate_t* jit, ctx_t* ctx)
+gen_concatstrings(jitstate_t* jit, ctx_t* ctx, codeblock_t* cb)
 {
     rb_num_t n = (rb_num_t)jit_get_arg(jit, 0);
 
@@ -1903,93 +1933,173 @@ typedef void (*cmov_fn)(codeblock_t* cb, x86opnd_t opnd0, x86opnd_t opnd1);
 static codegen_status_t
 gen_fixnum_cmp(jitstate_t* jit, ctx_t* ctx, cmov_fn cmov_op)
 {
-    // Create a size-exit to fall back to the interpreter
-    // Note: we generate the side-exit before popping operands from the stack
-    uint8_t* side_exit = yjit_side_exit(jit, ctx);
-
-    if (!assume_bop_not_redefined(jit->block, INTEGER_REDEFINED_OP_FLAG, BOP_LT)) {
-        return YJIT_CANT_COMPILE;
+    // Defer compilation so we can specialize base on a runtime receiver
+    if (!jit_at_current_insn(jit)) {
+        defer_compilation(jit->block, jit->insn_idx, ctx);
+        return YJIT_END_BLOCK;
     }
 
-    // Check that both operands are fixnums
-    guard_two_fixnums(ctx, side_exit);
+    VALUE comptime_a = jit_peek_at_stack(jit, ctx, 1);
+    VALUE comptime_b = jit_peek_at_stack(jit, ctx, 0);
 
-    // Get the operands from the stack
-    x86opnd_t arg1 = ctx_stack_pop(ctx, 1);
-    x86opnd_t arg0 = ctx_stack_pop(ctx, 1);
+    if (FIXNUM_P(comptime_a) && FIXNUM_P(comptime_b)) {
+        // Create a size-exit to fall back to the interpreter
+        // Note: we generate the side-exit before popping operands from the stack
+        uint8_t* side_exit = yjit_side_exit(jit, ctx);
 
-    // Compare the arguments
-    xor(cb, REG0_32, REG0_32); // REG0 = Qfalse
-    mov(cb, REG1, arg0);
-    cmp(cb, REG1, arg1);
-    mov(cb, REG1, imm_opnd(Qtrue));
-    cmov_op(cb, REG0, REG1);
+        if (!assume_bop_not_redefined(jit->block, INTEGER_REDEFINED_OP_FLAG, BOP_LT)) {
+            return YJIT_CANT_COMPILE;
+        }
 
-    // Push the output on the stack
-    x86opnd_t dst = ctx_stack_push(ctx, TYPE_UNKNOWN);
-    mov(cb, dst, REG0);
+        // Check that both operands are fixnums
+        guard_two_fixnums(ctx, side_exit);
 
-    return YJIT_KEEP_COMPILING;
+        // Get the operands from the stack
+        x86opnd_t arg1 = ctx_stack_pop(ctx, 1);
+        x86opnd_t arg0 = ctx_stack_pop(ctx, 1);
+
+        // Compare the arguments
+        xor(cb, REG0_32, REG0_32); // REG0 = Qfalse
+        mov(cb, REG1, arg0);
+        cmp(cb, REG1, arg1);
+        mov(cb, REG1, imm_opnd(Qtrue));
+        cmov_op(cb, REG0, REG1);
+
+        // Push the output on the stack
+        x86opnd_t dst = ctx_stack_push(ctx, TYPE_UNKNOWN);
+        mov(cb, dst, REG0);
+
+        return YJIT_KEEP_COMPILING;
+    } else {
+        return gen_opt_send_without_block(jit, ctx, cb);
+    }
 }
 
 static codegen_status_t
-gen_opt_lt(jitstate_t* jit, ctx_t* ctx)
+gen_opt_lt(jitstate_t* jit, ctx_t* ctx, codeblock_t* cb)
 {
     return gen_fixnum_cmp(jit, ctx, cmovl);
 }
 
 static codegen_status_t
-gen_opt_le(jitstate_t* jit, ctx_t* ctx)
+gen_opt_le(jitstate_t* jit, ctx_t* ctx, codeblock_t* cb)
 {
     return gen_fixnum_cmp(jit, ctx, cmovle);
 }
 
 static codegen_status_t
-gen_opt_ge(jitstate_t* jit, ctx_t* ctx)
+gen_opt_ge(jitstate_t* jit, ctx_t* ctx, codeblock_t* cb)
 {
     return gen_fixnum_cmp(jit, ctx, cmovge);
 }
 
 static codegen_status_t
-gen_opt_gt(jitstate_t* jit, ctx_t* ctx)
+gen_opt_gt(jitstate_t* jit, ctx_t* ctx, codeblock_t* cb)
 {
     return gen_fixnum_cmp(jit, ctx, cmovg);
 }
 
-VALUE rb_opt_equality_specialized(VALUE recv, VALUE obj);
-
-static codegen_status_t
-gen_opt_eq(jitstate_t* jit, ctx_t* ctx)
+// Implements specialized equality for either two fixnum or two strings
+// Returns true if code was generated, otherwise false
+bool
+gen_equality_specialized(jitstate_t* jit, ctx_t* ctx, uint8_t *side_exit)
 {
-    uint8_t* side_exit = yjit_side_exit(jit, ctx);
+    VALUE comptime_a = jit_peek_at_stack(jit, ctx, 1);
+    VALUE comptime_b = jit_peek_at_stack(jit, ctx, 0);
 
-    // Get the operands from the stack
-    x86opnd_t arg1 = ctx_stack_pop(ctx, 1);
-    x86opnd_t arg0 = ctx_stack_pop(ctx, 1);
+    x86opnd_t a_opnd = ctx_stack_opnd(ctx, 1);
+    x86opnd_t b_opnd = ctx_stack_opnd(ctx, 0);
 
-    // Call rb_opt_equality_specialized(VALUE recv, VALUE obj)
-    // We know this method won't allocate or perform calls
-    mov(cb, C_ARG_REGS[0], arg0);
-    mov(cb, C_ARG_REGS[1], arg1);
-    call_ptr(cb, REG0, (void *)rb_opt_equality_specialized);
+    if (FIXNUM_P(comptime_a) && FIXNUM_P(comptime_b)) {
+        if (!assume_bop_not_redefined(jit->block, INTEGER_REDEFINED_OP_FLAG, BOP_EQ)) {
+            // if overridden, emit the generic version
+            return false;
+        }
 
-    // If val == Qundef, bail to do a method call
-    cmp(cb, RAX, imm_opnd(Qundef));
-    je_ptr(cb, side_exit);
+        guard_two_fixnums(ctx, side_exit);
 
-    // Push the return value onto the stack
-    x86opnd_t stack_ret = ctx_stack_push(ctx, TYPE_IMM);
-    mov(cb, stack_ret, RAX);
+        mov(cb, REG0, a_opnd);
+        cmp(cb, REG0, b_opnd);
 
-    return YJIT_KEEP_COMPILING;
+        mov(cb, REG0, imm_opnd(Qfalse));
+        mov(cb, REG1, imm_opnd(Qtrue));
+        cmove(cb, REG0, REG1);
+
+        // Push the output on the stack
+        ctx_stack_pop(ctx, 2);
+        x86opnd_t dst = ctx_stack_push(ctx, TYPE_IMM);
+        mov(cb, dst, REG0);
+
+        return true;
+    } else if (CLASS_OF(comptime_a) == rb_cString &&
+            CLASS_OF(comptime_b) == rb_cString) {
+        if (!assume_bop_not_redefined(jit->block, STRING_REDEFINED_OP_FLAG, BOP_EQ)) {
+            // if overridden, emit the generic version
+            return false;
+        }
+
+        // Load a and b in preparation for call later
+        mov(cb, C_ARG_REGS[0], a_opnd);
+        mov(cb, C_ARG_REGS[1], b_opnd);
+
+        // Guard that a is a String
+        mov(cb, REG0, C_ARG_REGS[0]);
+        jit_guard_known_klass(jit, ctx, rb_cString, OPND_STACK(1), comptime_a, SEND_MAX_DEPTH, side_exit);
+
+        uint32_t ret = cb_new_label(cb, "ret");
+
+        // If they are equal by identity, return true
+        cmp(cb, C_ARG_REGS[0], C_ARG_REGS[1]);
+        mov(cb, RAX, imm_opnd(Qtrue));
+        je_label(cb, ret);
+
+        // Otherwise guard that b is a T_STRING (from type info) or String (from runtime guard)
+        if (ctx_get_opnd_type(ctx, OPND_STACK(0)).type != ETYPE_STRING) {
+            mov(cb, REG0, C_ARG_REGS[1]);
+            // Note: any T_STRING is valid here, but we check for a ::String for simplicity
+            jit_guard_known_klass(jit, ctx, rb_cString, OPND_STACK(0), comptime_b, SEND_MAX_DEPTH, side_exit);
+        }
+
+        // Call rb_str_eql_internal(a, b)
+        call_ptr(cb, REG0, (void *)rb_str_eql_internal);
+
+        // Push the output on the stack
+        cb_write_label(cb, ret);
+        ctx_stack_pop(ctx, 2);
+        x86opnd_t dst = ctx_stack_push(ctx, TYPE_IMM);
+        mov(cb, dst, RAX);
+        cb_link_labels(cb);
+
+        return true;
+    } else {
+        return false;
+    }
 }
 
-static codegen_status_t gen_opt_send_without_block(jitstate_t *jit, ctx_t *ctx);
+static codegen_status_t
+gen_opt_eq(jitstate_t* jit, ctx_t* ctx, codeblock_t* cb)
+{
+    // Defer compilation so we can specialize base on a runtime receiver
+    if (!jit_at_current_insn(jit)) {
+        defer_compilation(jit->block, jit->insn_idx, ctx);
+        return YJIT_END_BLOCK;
+    }
+
+    // Create a size-exit to fall back to the interpreter
+    uint8_t *side_exit = yjit_side_exit(jit, ctx);
+
+    if (gen_equality_specialized(jit, ctx, side_exit)) {
+        jit_jump_to_next_insn(jit, ctx);
+        return YJIT_END_BLOCK;
+    } else {
+        return gen_opt_send_without_block(jit, ctx, cb);
+    }
+}
 
 static codegen_status_t gen_send_general(jitstate_t *jit, ctx_t *ctx, struct rb_call_data *cd, rb_iseq_t *block);
 
 static codegen_status_t
-gen_opt_neq(jitstate_t* jit, ctx_t* ctx)
+gen_opt_neq(jitstate_t* jit, ctx_t* ctx, codeblock_t* cb)
 {
     // opt_neq is passed two rb_call_data as arguments:
     // first for ==, second for !=
@@ -1998,7 +2108,7 @@ gen_opt_neq(jitstate_t* jit, ctx_t* ctx)
 }
 
 static codegen_status_t
-gen_opt_aref(jitstate_t *jit, ctx_t *ctx)
+gen_opt_aref(jitstate_t* jit, ctx_t* ctx, codeblock_t* cb)
 {
     struct rb_call_data * cd = (struct rb_call_data *)jit_get_arg(jit, 0);
     int32_t argc = (int32_t)vm_ci_argc(cd->ci);
@@ -2011,7 +2121,7 @@ gen_opt_aref(jitstate_t *jit, ctx_t *ctx)
 
     // Defer compilation so we can specialize base on a runtime receiver
     if (!jit_at_current_insn(jit)) {
-        defer_compilation(jit->block, jit->insn_idx, ctx);
+        defer_compilation(cb, ocb, jit->block, jit->insn_idx, ctx);
         return YJIT_END_BLOCK;
     }
 
@@ -2122,181 +2232,283 @@ gen_opt_aref(jitstate_t *jit, ctx_t *ctx)
     }
     else {
         // General case. Call the [] method.
-        return gen_opt_send_without_block(jit, ctx);
+        return gen_opt_send_without_block(jit, ctx, cb);
     }
 }
 
-VALUE rb_vm_opt_aset(VALUE recv, VALUE obj, VALUE set);
-
 static codegen_status_t
-gen_opt_aset(jitstate_t *jit, ctx_t *ctx)
+gen_opt_aset(jitstate_t* jit, ctx_t* ctx, codeblock_t* cb)
 {
-    // Save the PC and SP because the callee may allocate
-    // Note that this modifies REG_SP, which is why we do it first
-    jit_prepare_routine_call(jit, ctx, REG0);
+    // Defer compilation so we can specialize on a runtime `self`
+    if (!jit_at_current_insn(jit)) {
+        defer_compilation(jit->block, jit->insn_idx, ctx);
+        return YJIT_END_BLOCK;
+    }
 
-    uint8_t* side_exit = yjit_side_exit(jit, ctx);
+    VALUE comptime_recv = jit_peek_at_stack(jit, ctx, 2);
+    VALUE comptime_key  = jit_peek_at_stack(jit, ctx, 1);
 
     // Get the operands from the stack
-    x86opnd_t arg2 = ctx_stack_pop(ctx, 1);
-    x86opnd_t arg1 = ctx_stack_pop(ctx, 1);
-    x86opnd_t arg0 = ctx_stack_pop(ctx, 1);
+    x86opnd_t recv = ctx_stack_opnd(ctx, 2);
+    x86opnd_t key = ctx_stack_opnd(ctx, 1);
+    x86opnd_t val = ctx_stack_opnd(ctx, 0);
 
-    // Call rb_vm_opt_aset(VALUE recv, VALUE obj)
-    mov(cb, C_ARG_REGS[0], arg0);
-    mov(cb, C_ARG_REGS[1], arg1);
-    mov(cb, C_ARG_REGS[2], arg2);
-    call_ptr(cb, REG0, (void *)rb_vm_opt_aset);
+    if (CLASS_OF(comptime_recv) == rb_cArray && FIXNUM_P(comptime_key)) {
+        uint8_t* side_exit = yjit_side_exit(jit, ctx);
 
-    // If val == Qundef, bail to do a method call
-    cmp(cb, RAX, imm_opnd(Qundef));
-    je_ptr(cb, side_exit);
+        // Guard receiver is an Array
+        mov(cb, REG0, recv);
+        jit_guard_known_klass(jit, ctx, rb_cArray, OPND_STACK(2), comptime_recv, SEND_MAX_DEPTH, side_exit);
 
-    // Push the return value onto the stack
-    x86opnd_t stack_ret = ctx_stack_push(ctx, TYPE_UNKNOWN);
-    mov(cb, stack_ret, RAX);
+        // Guard key is a fixnum
+        mov(cb, REG0, key);
+        jit_guard_known_klass(jit, ctx, rb_cInteger, OPND_STACK(1), comptime_key, SEND_MAX_DEPTH, side_exit);
 
-    return YJIT_KEEP_COMPILING;
+        // Call rb_ary_store
+        mov(cb, C_ARG_REGS[0], recv);
+        mov(cb, C_ARG_REGS[1], key);
+        sar(cb, C_ARG_REGS[1], imm_opnd(1)); // FIX2LONG(key)
+        mov(cb, C_ARG_REGS[2], val);
+
+        // We might allocate or raise
+        jit_prepare_routine_call(jit, ctx, REG0);
+
+        call_ptr(cb, REG0, (void *)rb_ary_store);
+
+        // rb_ary_store returns void
+        // stored value should still be on stack
+        mov(cb, REG0, ctx_stack_opnd(ctx, 0));
+
+        // Push the return value onto the stack
+        ctx_stack_pop(ctx, 3);
+        x86opnd_t stack_ret = ctx_stack_push(ctx, TYPE_UNKNOWN);
+        mov(cb, stack_ret, REG0);
+
+        jit_jump_to_next_insn(jit, ctx);
+        return YJIT_END_BLOCK;
+    } else if (CLASS_OF(comptime_recv) == rb_cHash) {
+        uint8_t* side_exit = yjit_side_exit(jit, ctx);
+
+        // Guard receiver is a Hash
+        mov(cb, REG0, recv);
+        jit_guard_known_klass(jit, ctx, rb_cHash, OPND_STACK(2), comptime_recv, SEND_MAX_DEPTH, side_exit);
+
+        // Call rb_hash_aset
+        mov(cb, C_ARG_REGS[0], recv);
+        mov(cb, C_ARG_REGS[1], key);
+        mov(cb, C_ARG_REGS[2], val);
+
+        // We might allocate or raise
+        jit_prepare_routine_call(jit, ctx, REG0);
+
+        call_ptr(cb, REG0, (void *)rb_hash_aset);
+
+        // Push the return value onto the stack
+        ctx_stack_pop(ctx, 3);
+        x86opnd_t stack_ret = ctx_stack_push(ctx, TYPE_UNKNOWN);
+        mov(cb, stack_ret, RAX);
+
+        jit_jump_to_next_insn(jit, ctx);
+        return YJIT_END_BLOCK;
+    } else {
+        return gen_opt_send_without_block(jit, ctx, cb);
+    }
 }
 
 static codegen_status_t
-gen_opt_and(jitstate_t* jit, ctx_t* ctx)
+gen_opt_and(jitstate_t* jit, ctx_t* ctx, codeblock_t* cb)
 {
-    // Create a size-exit to fall back to the interpreter
-    // Note: we generate the side-exit before popping operands from the stack
-    uint8_t* side_exit = yjit_side_exit(jit, ctx);
-
-    if (!assume_bop_not_redefined(jit->block, INTEGER_REDEFINED_OP_FLAG, BOP_AND)) {
-        return YJIT_CANT_COMPILE;
+    // Defer compilation so we can specialize on a runtime `self`
+    if (!jit_at_current_insn(jit)) {
+        defer_compilation(jit->block, jit->insn_idx, ctx);
+        return YJIT_END_BLOCK;
     }
 
-    // Check that both operands are fixnums
-    guard_two_fixnums(ctx, side_exit);
+    VALUE comptime_a = jit_peek_at_stack(jit, ctx, 1);
+    VALUE comptime_b = jit_peek_at_stack(jit, ctx, 0);
 
-    // Get the operands and destination from the stack
-    x86opnd_t arg1 = ctx_stack_pop(ctx, 1);
-    x86opnd_t arg0 = ctx_stack_pop(ctx, 1);
+    if (FIXNUM_P(comptime_a) && FIXNUM_P(comptime_b)) {
+        // Create a size-exit to fall back to the interpreter
+        // Note: we generate the side-exit before popping operands from the stack
+        uint8_t* side_exit = yjit_side_exit(jit, ctx);
 
-    // Do the bitwise and arg0 & arg1
-    mov(cb, REG0, arg0);
-    and(cb, REG0, arg1);
+        if (!assume_bop_not_redefined(jit->block, INTEGER_REDEFINED_OP_FLAG, BOP_AND)) {
+            return YJIT_CANT_COMPILE;
+        }
 
-    // Push the output on the stack
-    x86opnd_t dst = ctx_stack_push(ctx, TYPE_FIXNUM);
-    mov(cb, dst, REG0);
+        // Check that both operands are fixnums
+        guard_two_fixnums(ctx, side_exit);
 
-    return YJIT_KEEP_COMPILING;
+        // Get the operands and destination from the stack
+        x86opnd_t arg1 = ctx_stack_pop(ctx, 1);
+        x86opnd_t arg0 = ctx_stack_pop(ctx, 1);
+
+        // Do the bitwise and arg0 & arg1
+        mov(cb, REG0, arg0);
+        and(cb, REG0, arg1);
+
+        // Push the output on the stack
+        x86opnd_t dst = ctx_stack_push(ctx, TYPE_FIXNUM);
+        mov(cb, dst, REG0);
+
+        return YJIT_KEEP_COMPILING;
+    } else {
+        // Delegate to send, call the method on the recv
+        return gen_opt_send_without_block(jit, ctx, cb);
+    }
 }
 
 static codegen_status_t
-gen_opt_or(jitstate_t* jit, ctx_t* ctx)
+gen_opt_or(jitstate_t* jit, ctx_t* ctx, codeblock_t* cb)
 {
-    // Create a size-exit to fall back to the interpreter
-    // Note: we generate the side-exit before popping operands from the stack
-    uint8_t* side_exit = yjit_side_exit(jit, ctx);
-
-    if (!assume_bop_not_redefined(jit->block, INTEGER_REDEFINED_OP_FLAG, BOP_OR)) {
-        return YJIT_CANT_COMPILE;
+    // Defer compilation so we can specialize on a runtime `self`
+    if (!jit_at_current_insn(jit)) {
+        defer_compilation(jit->block, jit->insn_idx, ctx);
+        return YJIT_END_BLOCK;
     }
 
-    // Check that both operands are fixnums
-    guard_two_fixnums(ctx, side_exit);
+    VALUE comptime_a = jit_peek_at_stack(jit, ctx, 1);
+    VALUE comptime_b = jit_peek_at_stack(jit, ctx, 0);
 
-    // Get the operands and destination from the stack
-    x86opnd_t arg1 = ctx_stack_pop(ctx, 1);
-    x86opnd_t arg0 = ctx_stack_pop(ctx, 1);
+    if (FIXNUM_P(comptime_a) && FIXNUM_P(comptime_b)) {
+        // Create a size-exit to fall back to the interpreter
+        // Note: we generate the side-exit before popping operands from the stack
+        uint8_t* side_exit = yjit_side_exit(jit, ctx);
 
-    // Do the bitwise or arg0 | arg1
-    mov(cb, REG0, arg0);
-    or(cb, REG0, arg1);
+        if (!assume_bop_not_redefined(jit->block, INTEGER_REDEFINED_OP_FLAG, BOP_OR)) {
+            return YJIT_CANT_COMPILE;
+        }
 
-    // Push the output on the stack
-    x86opnd_t dst = ctx_stack_push(ctx, TYPE_FIXNUM);
-    mov(cb, dst, REG0);
+        // Check that both operands are fixnums
+        guard_two_fixnums(ctx, side_exit);
 
-    return YJIT_KEEP_COMPILING;
+        // Get the operands and destination from the stack
+        x86opnd_t arg1 = ctx_stack_pop(ctx, 1);
+        x86opnd_t arg0 = ctx_stack_pop(ctx, 1);
+
+        // Do the bitwise or arg0 | arg1
+        mov(cb, REG0, arg0);
+        or(cb, REG0, arg1);
+
+        // Push the output on the stack
+        x86opnd_t dst = ctx_stack_push(ctx, TYPE_FIXNUM);
+        mov(cb, dst, REG0);
+
+        return YJIT_KEEP_COMPILING;
+    } else {
+        // Delegate to send, call the method on the recv
+        return gen_opt_send_without_block(jit, ctx, cb);
+    }
 }
 
 static codegen_status_t
-gen_opt_minus(jitstate_t* jit, ctx_t* ctx)
+gen_opt_minus(jitstate_t* jit, ctx_t* ctx, codeblock_t* cb)
 {
-    // Create a size-exit to fall back to the interpreter
-    // Note: we generate the side-exit before popping operands from the stack
-    uint8_t* side_exit = yjit_side_exit(jit, ctx);
-
-    if (!assume_bop_not_redefined(jit->block, INTEGER_REDEFINED_OP_FLAG, BOP_MINUS)) {
-        return YJIT_CANT_COMPILE;
+    // Defer compilation so we can specialize on a runtime `self`
+    if (!jit_at_current_insn(jit)) {
+        defer_compilation(jit->block, jit->insn_idx, ctx);
+        return YJIT_END_BLOCK;
     }
 
-    // Check that both operands are fixnums
-    guard_two_fixnums(ctx, side_exit);
+    VALUE comptime_a = jit_peek_at_stack(jit, ctx, 1);
+    VALUE comptime_b = jit_peek_at_stack(jit, ctx, 0);
 
-    // Get the operands and destination from the stack
-    x86opnd_t arg1 = ctx_stack_pop(ctx, 1);
-    x86opnd_t arg0 = ctx_stack_pop(ctx, 1);
+    if (FIXNUM_P(comptime_a) && FIXNUM_P(comptime_b)) {
+        // Create a size-exit to fall back to the interpreter
+        // Note: we generate the side-exit before popping operands from the stack
+        uint8_t* side_exit = yjit_side_exit(jit, ctx);
 
-    // Subtract arg0 - arg1 and test for overflow
-    mov(cb, REG0, arg0);
-    sub(cb, REG0, arg1);
-    jo_ptr(cb, side_exit);
-    add(cb, REG0, imm_opnd(1));
+        if (!assume_bop_not_redefined(jit->block, INTEGER_REDEFINED_OP_FLAG, BOP_MINUS)) {
+            return YJIT_CANT_COMPILE;
+        }
 
-    // Push the output on the stack
-    x86opnd_t dst = ctx_stack_push(ctx, TYPE_FIXNUM);
-    mov(cb, dst, REG0);
+        // Check that both operands are fixnums
+        guard_two_fixnums(ctx, side_exit);
 
-    return YJIT_KEEP_COMPILING;
+        // Get the operands and destination from the stack
+        x86opnd_t arg1 = ctx_stack_pop(ctx, 1);
+        x86opnd_t arg0 = ctx_stack_pop(ctx, 1);
+
+        // Subtract arg0 - arg1 and test for overflow
+        mov(cb, REG0, arg0);
+        sub(cb, REG0, arg1);
+        jo_ptr(cb, side_exit);
+        add(cb, REG0, imm_opnd(1));
+
+        // Push the output on the stack
+        x86opnd_t dst = ctx_stack_push(ctx, TYPE_FIXNUM);
+        mov(cb, dst, REG0);
+
+        return YJIT_KEEP_COMPILING;
+    } else {
+        // Delegate to send, call the method on the recv
+        return gen_opt_send_without_block(jit, ctx, cb);
+    }
 }
 
 static codegen_status_t
-gen_opt_plus(jitstate_t* jit, ctx_t* ctx)
+gen_opt_plus(jitstate_t* jit, ctx_t* ctx, codeblock_t* cb)
 {
-    // Create a size-exit to fall back to the interpreter
-    // Note: we generate the side-exit before popping operands from the stack
-    uint8_t* side_exit = yjit_side_exit(jit, ctx);
-
-    if (!assume_bop_not_redefined(jit->block, INTEGER_REDEFINED_OP_FLAG, BOP_PLUS)) {
-        return YJIT_CANT_COMPILE;
+    // Defer compilation so we can specialize on a runtime `self`
+    if (!jit_at_current_insn(jit)) {
+        defer_compilation(jit->block, jit->insn_idx, ctx);
+        return YJIT_END_BLOCK;
     }
 
-    // Check that both operands are fixnums
-    guard_two_fixnums(ctx, side_exit);
+    VALUE comptime_a = jit_peek_at_stack(jit, ctx, 1);
+    VALUE comptime_b = jit_peek_at_stack(jit, ctx, 0);
 
-    // Get the operands and destination from the stack
-    x86opnd_t arg1 = ctx_stack_pop(ctx, 1);
-    x86opnd_t arg0 = ctx_stack_pop(ctx, 1);
+    if (FIXNUM_P(comptime_a) && FIXNUM_P(comptime_b)) {
+        // Create a size-exit to fall back to the interpreter
+        // Note: we generate the side-exit before popping operands from the stack
+        uint8_t* side_exit = yjit_side_exit(jit, ctx);
 
-    // Add arg0 + arg1 and test for overflow
-    mov(cb, REG0, arg0);
-    sub(cb, REG0, imm_opnd(1));
-    add(cb, REG0, arg1);
-    jo_ptr(cb, side_exit);
+        if (!assume_bop_not_redefined(jit->block, INTEGER_REDEFINED_OP_FLAG, BOP_PLUS)) {
+            return YJIT_CANT_COMPILE;
+        }
 
-    // Push the output on the stack
-    x86opnd_t dst = ctx_stack_push(ctx, TYPE_FIXNUM);
-    mov(cb, dst, REG0);
+        // Check that both operands are fixnums
+        guard_two_fixnums(ctx, side_exit);
 
-    return YJIT_KEEP_COMPILING;
+        // Get the operands and destination from the stack
+        x86opnd_t arg1 = ctx_stack_pop(ctx, 1);
+        x86opnd_t arg0 = ctx_stack_pop(ctx, 1);
+
+        // Add arg0 + arg1 and test for overflow
+        mov(cb, REG0, arg0);
+        sub(cb, REG0, imm_opnd(1));
+        add(cb, REG0, arg1);
+        jo_ptr(cb, side_exit);
+
+        // Push the output on the stack
+        x86opnd_t dst = ctx_stack_push(ctx, TYPE_FIXNUM);
+        mov(cb, dst, REG0);
+
+        return YJIT_KEEP_COMPILING;
+    } else {
+        // Delegate to send, call the method on the recv
+        return gen_opt_send_without_block(jit, ctx, cb);
+    }
 }
 
 static codegen_status_t
-gen_opt_mult(jitstate_t* jit, ctx_t* ctx)
+gen_opt_mult(jitstate_t* jit, ctx_t* ctx, codeblock_t* cb)
 {
     // Delegate to send, call the method on the recv
-    return gen_opt_send_without_block(jit, ctx);
+    return gen_opt_send_without_block(jit, ctx, cb);
 }
 
 static codegen_status_t
-gen_opt_div(jitstate_t* jit, ctx_t* ctx)
+gen_opt_div(jitstate_t* jit, ctx_t* ctx, codeblock_t* cb)
 {
     // Delegate to send, call the method on the recv
-    return gen_opt_send_without_block(jit, ctx);
+    return gen_opt_send_without_block(jit, ctx, cb);
 }
 
 VALUE rb_vm_opt_mod(VALUE recv, VALUE obj);
 
 static codegen_status_t
-gen_opt_mod(jitstate_t* jit, ctx_t* ctx)
+gen_opt_mod(jitstate_t* jit, ctx_t* ctx, codeblock_t* cb)
 {
     // Save the PC and SP because the callee may allocate bignums
     // Note that this modifies REG_SP, which is why we do it first
@@ -2325,28 +2537,28 @@ gen_opt_mod(jitstate_t* jit, ctx_t* ctx)
 }
 
 static codegen_status_t
-gen_opt_ltlt(jitstate_t* jit, ctx_t* ctx)
+gen_opt_ltlt(jitstate_t* jit, ctx_t* ctx, codeblock_t* cb)
 {
     // Delegate to send, call the method on the recv
-    return gen_opt_send_without_block(jit, ctx);
+    return gen_opt_send_without_block(jit, ctx, cb);
 }
 
 static codegen_status_t
-gen_opt_nil_p(jitstate_t* jit, ctx_t* ctx)
+gen_opt_nil_p(jitstate_t* jit, ctx_t* ctx, codeblock_t* cb)
 {
     // Delegate to send, call the method on the recv
-    return gen_opt_send_without_block(jit, ctx);
+    return gen_opt_send_without_block(jit, ctx, cb);
 }
 
 static codegen_status_t
-gen_opt_empty_p(jitstate_t* jit, ctx_t* ctx)
+gen_opt_empty_p(jitstate_t* jit, ctx_t* ctx, codeblock_t* cb)
 {
     // Delegate to send, call the method on the recv
-    return gen_opt_send_without_block(jit, ctx);
+    return gen_opt_send_without_block(jit, ctx, cb);
 }
 
 static codegen_status_t
-gen_opt_str_freeze(jitstate_t* jit, ctx_t* ctx)
+gen_opt_str_freeze(jitstate_t* jit, ctx_t* ctx, codeblock_t* cb)
 {
     if (!assume_bop_not_redefined(jit->block, STRING_REDEFINED_OP_FLAG, BOP_FREEZE)) {
         return YJIT_CANT_COMPILE;
@@ -2363,7 +2575,7 @@ gen_opt_str_freeze(jitstate_t* jit, ctx_t* ctx)
 }
 
 static codegen_status_t
-gen_opt_str_uminus(jitstate_t* jit, ctx_t* ctx)
+gen_opt_str_uminus(jitstate_t* jit, ctx_t* ctx, codeblock_t* cb)
 {
     if (!assume_bop_not_redefined(jit->block, STRING_REDEFINED_OP_FLAG, BOP_UMINUS)) {
         return YJIT_CANT_COMPILE;
@@ -2380,27 +2592,43 @@ gen_opt_str_uminus(jitstate_t* jit, ctx_t* ctx)
 }
 
 static codegen_status_t
-gen_opt_not(jitstate_t *jit, ctx_t *ctx)
+gen_opt_not(jitstate_t* jit, ctx_t* ctx, codeblock_t* cb)
 {
-    return gen_opt_send_without_block(jit, ctx);
+    return gen_opt_send_without_block(jit, ctx, cb);
 }
 
 static codegen_status_t
-gen_opt_size(jitstate_t *jit, ctx_t *ctx)
+gen_opt_size(jitstate_t* jit, ctx_t* ctx, codeblock_t* cb)
 {
-    return gen_opt_send_without_block(jit, ctx);
+    return gen_opt_send_without_block(jit, ctx, cb);
 }
 
 static codegen_status_t
-gen_opt_length(jitstate_t *jit, ctx_t *ctx)
+gen_opt_length(jitstate_t* jit, ctx_t* ctx, codeblock_t* cb)
 {
-    return gen_opt_send_without_block(jit, ctx);
+    return gen_opt_send_without_block(jit, ctx, cb);
 }
 
 static codegen_status_t
-gen_opt_regexpmatch2(jitstate_t *jit, ctx_t *ctx)
+gen_opt_regexpmatch2(jitstate_t* jit, ctx_t* ctx, codeblock_t* cb)
 {
-    return gen_opt_send_without_block(jit, ctx);
+    return gen_opt_send_without_block(jit, ctx, cb);
+}
+
+static codegen_status_t
+gen_opt_case_dispatch(jitstate_t* jit, ctx_t* ctx, codeblock_t* cb)
+{
+    // Normally this instruction would lookup the key in a hash and jump to an
+    // offset based on that.
+    // Instead we can take the fallback case and continue with the next
+    // instruciton.
+    // We'd hope that our jitted code will be sufficiently fast without the
+    // hash lookup, at least for small hashes, but it's worth revisiting this
+    // assumption in the future.
+
+    ctx_stack_pop(ctx, 1);
+
+    return YJIT_KEEP_COMPILING; // continue with the next instruction
 }
 
 void
@@ -2424,7 +2652,7 @@ gen_branchif_branch(codeblock_t* cb, uint8_t* target0, uint8_t* target1, uint8_t
 }
 
 static codegen_status_t
-gen_branchif(jitstate_t* jit, ctx_t* ctx)
+gen_branchif(jitstate_t* jit, ctx_t* ctx, codeblock_t* cb)
 {
     int32_t jump_offset = (int32_t)jit_get_arg(jit, 0);
 
@@ -2448,6 +2676,8 @@ gen_branchif(jitstate_t* jit, ctx_t* ctx)
 
     // Generate the branch instructions
     gen_branch(
+        cb,
+        ocb,
         jit->block,
         ctx,
         jump_block,
@@ -2481,7 +2711,7 @@ gen_branchunless_branch(codeblock_t* cb, uint8_t* target0, uint8_t* target1, uin
 }
 
 static codegen_status_t
-gen_branchunless(jitstate_t* jit, ctx_t* ctx)
+gen_branchunless(jitstate_t* jit, ctx_t* ctx, codeblock_t* cb)
 {
     int32_t jump_offset = (int32_t)jit_get_arg(jit, 0);
 
@@ -2505,6 +2735,8 @@ gen_branchunless(jitstate_t* jit, ctx_t* ctx)
 
     // Generate the branch instructions
     gen_branch(
+        cb,
+        ocb,
         jit->block,
         ctx,
         jump_block,
@@ -2538,7 +2770,7 @@ gen_branchnil_branch(codeblock_t* cb, uint8_t* target0, uint8_t* target1, uint8_
 }
 
 static codegen_status_t
-gen_branchnil(jitstate_t* jit, ctx_t* ctx)
+gen_branchnil(jitstate_t* jit, ctx_t* ctx, codeblock_t* cb)
 {
     int32_t jump_offset = (int32_t)jit_get_arg(jit, 0);
 
@@ -2561,6 +2793,8 @@ gen_branchnil(jitstate_t* jit, ctx_t* ctx)
 
     // Generate the branch instructions
     gen_branch(
+        cb,
+        ocb,
         jit->block,
         ctx,
         jump_block,
@@ -2574,7 +2808,7 @@ gen_branchnil(jitstate_t* jit, ctx_t* ctx)
 }
 
 static codegen_status_t
-gen_jump(jitstate_t* jit, ctx_t* ctx)
+gen_jump(jitstate_t* jit, ctx_t* ctx, codeblock_t* cb)
 {
     int32_t jump_offset = (int32_t)jit_get_arg(jit, 0);
 
@@ -2590,6 +2824,7 @@ gen_jump(jitstate_t* jit, ctx_t* ctx)
 
     // Generate the jump instruction
     gen_direct_jump(
+        cb,
         jit->block,
         ctx,
         jump_block
@@ -2779,6 +3014,48 @@ jit_rb_obj_not(jitstate_t *jit, ctx_t *ctx, const struct rb_callinfo *ci, const 
     return true;
 }
 
+// Codegen for rb_true()
+static bool
+jit_rb_true(jitstate_t *jit, ctx_t *ctx, const struct rb_callinfo *ci, const rb_callable_method_entry_t *cme, rb_iseq_t *block, const int32_t argc)
+{
+    ADD_COMMENT(cb, "nil? == true");
+    ctx_stack_pop(ctx, 1);
+    x86opnd_t stack_ret = ctx_stack_push(ctx, TYPE_TRUE);
+    mov(cb, stack_ret, imm_opnd(Qtrue));
+    return true;
+}
+
+// Codegen for rb_false()
+static bool
+jit_rb_false(jitstate_t *jit, ctx_t *ctx, const struct rb_callinfo *ci, const rb_callable_method_entry_t *cme, rb_iseq_t *block, const int32_t argc)
+{
+    ADD_COMMENT(cb, "nil? == false");
+    ctx_stack_pop(ctx, 1);
+    x86opnd_t stack_ret = ctx_stack_push(ctx, TYPE_FALSE);
+    mov(cb, stack_ret, imm_opnd(Qfalse));
+    return true;
+}
+
+// Codegen for rb_obj_equal()
+// object identity comparison
+static bool
+jit_rb_obj_equal(jitstate_t *jit, ctx_t *ctx, const struct rb_callinfo *ci, const rb_callable_method_entry_t *cme, rb_iseq_t *block, const int32_t argc)
+{
+    ADD_COMMENT(cb, "equal?");
+    x86opnd_t obj1 = ctx_stack_pop(ctx, 1);
+    x86opnd_t obj2 = ctx_stack_pop(ctx, 1);
+
+    mov(cb, REG0, obj1);
+    cmp(cb, REG0, obj2);
+    mov(cb, REG0, imm_opnd(Qtrue));
+    mov(cb, REG1, imm_opnd(Qfalse));
+    cmovne(cb, REG0, REG1);
+
+    x86opnd_t stack_ret = ctx_stack_push(ctx, TYPE_IMM);
+    mov(cb, stack_ret, REG0);
+    return true;
+}
+
 // Check if we know how to codegen for a particular cfunc method
 static method_codegen_t
 lookup_cfunc_codegen(const rb_method_definition_t *def)
@@ -2808,7 +3085,7 @@ gen_send_cfunc(jitstate_t *jit, ctx_t *ctx, const struct rb_callinfo *ci, const 
     }
 
     // Don't JIT functions that need C stack arguments for now
-    if (argc + 1 > NUM_C_ARG_REGS) {
+    if (cfunc->argc >= 0 && argc + 1 > NUM_C_ARG_REGS) {
         GEN_COUNTER_INC(cb, send_cfunc_toomany_args);
         return YJIT_CANT_COMPILE;
     }
@@ -2863,7 +3140,7 @@ gen_send_cfunc(jitstate_t *jit, ctx_t *ctx, const struct rb_callinfo *ci, const 
     // Stack overflow check
     // #define CHECK_VM_STACK_OVERFLOW0(cfp, sp, margin)
     // REG_CFP <= REG_SP + 4 * sizeof(VALUE) + sizeof(rb_control_frame_t)
-    lea(cb, REG0, ctx_sp_opnd(ctx, sizeof(VALUE) * 4 + sizeof(rb_control_frame_t)));
+    lea(cb, REG0, ctx_sp_opnd(ctx, sizeof(VALUE) * 4 + 2 * sizeof(rb_control_frame_t)));
     cmp(cb, REG_CFP, REG0);
     jle_ptr(cb, COUNTED_EXIT(side_exit, send_se_cf_overflow));
 
@@ -3000,9 +3277,8 @@ gen_send_cfunc(jitstate_t *jit, ctx_t *ctx, const struct rb_callinfo *ci, const 
     // cfunc calls may corrupt types
     ctx_clear_local_types(ctx);
 
-    // Note: gen_send_iseq() jumps to the next instruction with ctx->sp_offset == 0
-    // after the call, while this does not. This difference prevents
-    // the two call types from sharing the same successor.
+    // Note: the return block of gen_send_iseq() has ctx->sp_offset == 1
+    // which allows for sharing the same successor.
 
     // Jump (fall through) to the call continuation block
     // We do this to end the current block after the call
@@ -3122,9 +3398,6 @@ gen_send_iseq(jitstate_t *jit, ctx_t *ctx, const struct rb_callinfo *ci, const r
         return YJIT_CANT_COMPILE;
     }
 
-    // The starting pc of the callee frame
-    const VALUE *start_pc = &iseq->body->iseq_encoded[start_pc_offset];
-
     // Number of locals that are not parameters
     const int num_locals = iseq->body->local_table_size - num_params;
 
@@ -3162,9 +3435,10 @@ gen_send_iseq(jitstate_t *jit, ctx_t *ctx, const struct rb_callinfo *ci, const r
     }
 
     // Stack overflow check
+    // Note that vm_push_frame checks it against a decremented cfp, hence the multiply by 2.
     // #define CHECK_VM_STACK_OVERFLOW0(cfp, sp, margin)
     ADD_COMMENT(cb, "stack overflow check");
-    lea(cb, REG0, ctx_sp_opnd(ctx, sizeof(VALUE) * (num_locals + iseq->body->stack_max) + sizeof(rb_control_frame_t)));
+    lea(cb, REG0, ctx_sp_opnd(ctx, sizeof(VALUE) * (num_locals + iseq->body->stack_max) + 2 * sizeof(rb_control_frame_t)));
     cmp(cb, REG_CFP, REG0);
     jle_ptr(cb, COUNTED_EXIT(side_exit, send_se_cf_overflow));
 
@@ -3241,8 +3515,11 @@ gen_send_iseq(jitstate_t *jit, ctx_t *ctx, const struct rb_callinfo *ci, const r
     mov(cb, member_opnd(REG_CFP, rb_control_frame_t, self), REG0);
     jit_mov_gc_ptr(jit, cb, REG0, (VALUE)iseq);
     mov(cb, member_opnd(REG_CFP, rb_control_frame_t, iseq), REG0);
-    mov(cb, REG0, const_ptr_opnd(start_pc));
-    mov(cb, member_opnd(REG_CFP, rb_control_frame_t, pc), REG0);
+
+    // No need to set cfp->pc since the callee sets it whenever calling into routines
+    // that could look at it through jit_save_pc().
+    // mov(cb, REG0, const_ptr_opnd(start_pc));
+    // mov(cb, member_opnd(REG_CFP, rb_control_frame_t, pc), REG0);
 
     // Setup cfp->jit_return for the callee
     uint32_t return_label = cb_new_label(cb, "send_return_point");
@@ -3263,14 +3540,45 @@ gen_send_iseq(jitstate_t *jit, ctx_t *ctx, const struct rb_callinfo *ci, const r
     // The callee might change locals through Kernel#binding and other means.
     ctx_clear_local_types(ctx);
 
+  <<<<<<< block-wrappers
+  =======
+    // Pop arguments and receiver in return context, push the return value
+    // After the return, sp_offset will be 1. The codegen for leave writes
+    // the return value in case of JIT-to-JIT return.
+    ctx_t return_ctx = *ctx;
+    ctx_stack_pop(&return_ctx, argc + 1);
+    ctx_stack_push(&return_ctx, TYPE_UNKNOWN);
+    return_ctx.sp_offset = 1;
+    return_ctx.chain_depth = 0;
+
+    // Write the JIT return address on the callee frame
+    gen_branch(
+        cb,
+        ocb,
+        jit->block,
+        ctx,
+        return_block,
+        &return_ctx,
+        return_block,
+        &return_ctx,
+        gen_return_branch
+    );
+
+  >>>>>>> code_pages_the_sequel
     //print_str(cb, "calling Ruby func:");
     //print_str(cb, rb_id2name(vm_ci_mid(ci)));
 
     // Load the updated SP from the CFP
     mov(cb, REG_SP, member_opnd(REG_CFP, rb_control_frame_t, sp));
 
+  <<<<<<< block-wrappers
     // Jump to the entry point of the callee
     gen_branch(
+  =======
+    // Directly jump to the entry point of the callee
+    gen_direct_jump(
+        cb,
+  >>>>>>> code_pages_the_sequel
         jit->block,
         ctx,
         (blockid_t){ iseq, start_pc_offset },
@@ -3332,7 +3640,7 @@ gen_send_general(jitstate_t *jit, ctx_t *ctx, struct rb_call_data *cd, rb_iseq_t
 
     // Defer compilation so we can specialize on class of receiver
     if (!jit_at_current_insn(jit)) {
-        defer_compilation(jit->block, jit->insn_idx, ctx);
+        defer_compilation(cb, ocb, jit->block, jit->insn_idx, ctx);
         return YJIT_END_BLOCK;
     }
 
@@ -3401,8 +3709,13 @@ gen_send_general(jitstate_t *jit, ctx_t *ctx, struct rb_call_data *cd, rb_iseq_t
                 return gen_get_ivar(jit, ctx, SEND_MAX_DEPTH, comptime_recv, ivar_name, recv_opnd, side_exit);
             }
         case VM_METHOD_TYPE_ATTRSET:
-            GEN_COUNTER_INC(cb, send_ivar_set_method);
-            return YJIT_CANT_COMPILE;
+            if (argc != 1 || !RB_TYPE_P(comptime_recv, T_OBJECT)) {
+                GEN_COUNTER_INC(cb, send_ivar_set_method);
+                return YJIT_CANT_COMPILE;
+            } else {
+                ID ivar_name = cme->def->body.attr.id;
+                return gen_set_ivar(jit, ctx, comptime_recv, comptime_recv_klass, ivar_name);
+            }
         case VM_METHOD_TYPE_BMETHOD:
             GEN_COUNTER_INC(cb, send_bmethod);
             return YJIT_CANT_COMPILE;
@@ -3438,47 +3751,47 @@ gen_send_general(jitstate_t *jit, ctx_t *ctx, struct rb_call_data *cd, rb_iseq_t
 }
 
 static codegen_status_t
-gen_opt_send_without_block(jitstate_t *jit, ctx_t *ctx)
+gen_opt_send_without_block(jitstate_t* jit, ctx_t* ctx, codeblock_t* cb)
 {
     struct rb_call_data *cd = (struct rb_call_data *)jit_get_arg(jit, 0);
     return gen_send_general(jit, ctx, cd, NULL);
 }
 
 static codegen_status_t
-gen_send(jitstate_t *jit, ctx_t *ctx)
+gen_send(jitstate_t* jit, ctx_t* ctx, codeblock_t* cb)
 {
     struct rb_call_data *cd = (struct rb_call_data *)jit_get_arg(jit, 0);
     rb_iseq_t *block = (rb_iseq_t *)jit_get_arg(jit, 1);
     return gen_send_general(jit, ctx, cd, block);
 }
 
-// Not in use as it's incorrect in some situations. See comments.
-RBIMPL_ATTR_MAYBE_UNUSED()
 static codegen_status_t
-gen_invokesuper(jitstate_t *jit, ctx_t *ctx)
+gen_invokesuper(jitstate_t* jit, ctx_t* ctx, codeblock_t* cb)
 {
     struct rb_call_data *cd = (struct rb_call_data *)jit_get_arg(jit, 0);
     rb_iseq_t *block = (rb_iseq_t *)jit_get_arg(jit, 1);
 
     // Defer compilation so we can specialize on class of receiver
     if (!jit_at_current_insn(jit)) {
-        defer_compilation(jit->block, jit->insn_idx, ctx);
+        defer_compilation(cb, ocb, jit->block, jit->insn_idx, ctx);
         return YJIT_END_BLOCK;
     }
 
     const rb_callable_method_entry_t *me = rb_vm_frame_method_entry(jit->ec->cfp);
     if (!me) {
         return YJIT_CANT_COMPILE;
-    } else if (me->def->type == VM_METHOD_TYPE_BMETHOD) {
-        // In the interpreter the method id can change which is tested for and
-        // invalidates the cache.
-        // By skipping super calls inside a BMETHOD definition, I believe we
-        // avoid this case
-        return YJIT_CANT_COMPILE;
     }
 
+    // FIXME: We should track and invalidate this block when this cme is invalidated
     VALUE current_defined_class = me->defined_class;
     ID mid = me->def->original_id;
+
+    if (me != rb_callable_method_entry(current_defined_class, me->called_id)) {
+        // Though we likely could generate this call, as we are only concerned
+        // with the method entry remaining valid, assume_method_lookup_stable
+        // below requires that the method lookup matches as well
+        return YJIT_CANT_COMPILE;
+    }
 
     // vm_search_normal_superclass
     if (BUILTIN_TYPE(current_defined_class) == T_ICLASS && FL_TEST_RAW(RBASIC(current_defined_class)->klass, RMODULE_IS_REFINEMENT)) {
@@ -3496,22 +3809,13 @@ gen_invokesuper(jitstate_t *jit, ctx_t *ctx)
         return YJIT_CANT_COMPILE;
     }
 
-    VALUE comptime_recv = jit_peek_at_stack(jit, ctx, argc);
-    VALUE comptime_recv_klass = CLASS_OF(comptime_recv);
-
     // Ensure we haven't rebound this method onto an incompatible class.
     // In the interpreter we try to avoid making this check by performing some
-    // cheaper calculations first, but since we specialize on the receiver
-    // class and so only have to do this once at compile time this is fine to
-    // always check and side exit.
+    // cheaper calculations first, but since we specialize on the method entry
+    // and so only have to do this once at compile time this is fine to always
+    // check and side exit.
+    VALUE comptime_recv = jit_peek_at_stack(jit, ctx, argc);
     if (!rb_obj_is_kind_of(comptime_recv, current_defined_class)) {
-        return YJIT_CANT_COMPILE;
-    }
-
-    // Because we're assuming only one current_defined_class for a given
-    // receiver class we need to check that the superclass doesn't also
-    // re-include the same module.
-    if (rb_class_search_ancestor(comptime_superclass, current_defined_class)) {
         return YJIT_CANT_COMPILE;
     }
 
@@ -3535,6 +3839,18 @@ gen_invokesuper(jitstate_t *jit, ctx_t *ctx)
     // Guard that the receiver has the same class as the one from compile time
     uint8_t *side_exit = yjit_side_exit(jit, ctx);
 
+    if (jit->ec->cfp->ep[VM_ENV_DATA_INDEX_ME_CREF] != (VALUE)me) {
+        // This will be the case for super within a block
+        return YJIT_CANT_COMPILE;
+    }
+
+    ADD_COMMENT(cb, "guard known me");
+    mov(cb, REG0, member_opnd(REG_CFP, rb_control_frame_t, ep));
+    x86opnd_t ep_me_opnd = mem_opnd(64, REG0, SIZEOF_VALUE * VM_ENV_DATA_INDEX_ME_CREF);
+    jit_mov_gc_ptr(jit, cb, REG1, (VALUE)me);
+    cmp(cb, ep_me_opnd, REG1);
+    jne_ptr(cb, COUNTED_EXIT(side_exit, invokesuper_me_changed));
+
     if (!block) {
         // Guard no block passed
         // rb_vm_frame_block_handler(GET_EC()->cfp) == VM_BLOCK_HANDLER_NONE
@@ -3543,25 +3859,20 @@ gen_invokesuper(jitstate_t *jit, ctx_t *ctx)
         // TODO: this could properly forward the current block handler, but
         // would require changes to gen_send_*
         ADD_COMMENT(cb, "guard no block given");
-        mov(cb, REG0, member_opnd(REG_CFP, rb_control_frame_t, ep));
-        mov(cb, REG0, mem_opnd(64, REG0, SIZEOF_VALUE * VM_ENV_DATA_INDEX_SPECVAL));
-        cmp(cb, REG0, imm_opnd(VM_BLOCK_HANDLER_NONE));
-        jne_ptr(cb, side_exit);
+        // EP is in REG0 from above
+        x86opnd_t ep_specval_opnd = mem_opnd(64, REG0, SIZEOF_VALUE * VM_ENV_DATA_INDEX_SPECVAL);
+        cmp(cb, ep_specval_opnd, imm_opnd(VM_BLOCK_HANDLER_NONE));
+        jne_ptr(cb, COUNTED_EXIT(side_exit, invokesuper_block));
     }
 
     // Points to the receiver operand on the stack
     x86opnd_t recv = ctx_stack_opnd(ctx, argc);
-    insn_opnd_t recv_opnd = OPND_STACK(argc);
     mov(cb, REG0, recv);
 
-    // FIXME: This guard and the assume_method_lookup_stable() call below isn't
-    // always enough to correctly replicate the interpreter's behavior of
-    // searching at runtime for the callee through the method entry of the stack frame.
-    if (!jit_guard_known_klass(jit, ctx, comptime_recv_klass, recv_opnd, comptime_recv, SEND_MAX_DEPTH, side_exit)) {
-        return YJIT_CANT_COMPILE;
-    }
-
-    assume_method_lookup_stable(comptime_recv_klass, cme, jit->block);
+    // We need to assume that both our current method entry and the super
+    // method entry we invoke remain stable
+    assume_method_lookup_stable(current_defined_class, me, jit->block);
+    assume_method_lookup_stable(comptime_superclass, cme, jit->block);
 
     // Method calls may corrupt types
     ctx_clear_local_types(ctx);
@@ -3579,7 +3890,7 @@ gen_invokesuper(jitstate_t *jit, ctx_t *ctx)
 }
 
 static codegen_status_t
-gen_leave(jitstate_t* jit, ctx_t* ctx)
+gen_leave(jitstate_t* jit, ctx_t* ctx, codeblock_t* cb)
 {
     // Only the return value should be on the stack
     RUBY_ASSERT(ctx->stack_size == 1);
@@ -3602,8 +3913,15 @@ gen_leave(jitstate_t* jit, ctx_t* ctx)
     add(cb, REG_CFP, imm_opnd(sizeof(rb_control_frame_t)));
     mov(cb, member_opnd(REG_EC, rb_execution_context_t, cfp), REG_CFP);
 
+  <<<<<<< block-wrappers
     // Restore the caller's REG_SP
     mov(cb, REG_SP, member_opnd(REG_CFP, rb_control_frame_t, sp));
+  =======
+    // Reload REG_SP for the caller and write the return value.
+    // Top of the stack is REG_SP[0] since the caller has sp_offset=1.
+    mov(cb, REG_SP, member_opnd(REG_CFP, rb_control_frame_t, sp));
+    mov(cb, mem_opnd(64, REG_SP, 0), REG0);
+  >>>>>>> code_pages_the_sequel
 
     // Jump to the JIT return address on the frame that was just popped
     const int32_t offset_to_jit_return = -((int32_t)sizeof(rb_control_frame_t)) + (int32_t)offsetof(rb_control_frame_t, jit_return);
@@ -3615,7 +3933,7 @@ gen_leave(jitstate_t* jit, ctx_t* ctx)
 RUBY_EXTERN rb_serial_t ruby_vm_global_constant_state;
 
 static codegen_status_t
-gen_getglobal(jitstate_t* jit, ctx_t* ctx)
+gen_getglobal(jitstate_t* jit, ctx_t* ctx, codeblock_t* cb)
 {
     ID gid = jit_get_arg(jit, 0);
 
@@ -3633,7 +3951,7 @@ gen_getglobal(jitstate_t* jit, ctx_t* ctx)
 }
 
 static codegen_status_t
-gen_setglobal(jitstate_t* jit, ctx_t* ctx)
+gen_setglobal(jitstate_t* jit, ctx_t* ctx, codeblock_t* cb)
 {
     ID gid = jit_get_arg(jit, 0);
 
@@ -3653,7 +3971,7 @@ gen_setglobal(jitstate_t* jit, ctx_t* ctx)
 }
 
 static codegen_status_t
-gen_tostring(jitstate_t* jit, ctx_t* ctx)
+gen_tostring(jitstate_t* jit, ctx_t* ctx, codeblock_t* cb)
 {
     // Save the PC and SP because we might make a Ruby call for
     // Kernel#set_trace_var
@@ -3675,7 +3993,7 @@ gen_tostring(jitstate_t* jit, ctx_t* ctx)
 }
 
 static codegen_status_t
-gen_toregexp(jitstate_t* jit, ctx_t* ctx)
+gen_toregexp(jitstate_t* jit, ctx_t* ctx, codeblock_t* cb)
 {
     rb_num_t opt = jit_get_arg(jit, 0);
     rb_num_t cnt = jit_get_arg(jit, 1);
@@ -3715,13 +4033,84 @@ gen_toregexp(jitstate_t* jit, ctx_t* ctx)
 }
 
 static codegen_status_t
-gen_opt_getinlinecache(jitstate_t *jit, ctx_t *ctx)
+gen_getspecial(jitstate_t* jit, ctx_t* ctx, codeblock_t* cb)
+{
+    // This takes two arguments, key and type
+    // key is only used when type == 0
+    // A non-zero type determines which type of backref to fetch
+    //rb_num_t key = jit_get_arg(jit, 0);
+    rb_num_t type = jit_get_arg(jit, 1);
+
+    if (type == 0) {
+        // not yet implemented
+        return YJIT_CANT_COMPILE;
+    } else if (type & 0x01) {
+        // Fetch a "special" backref based on a char encoded by shifting by 1
+
+        // Can raise if matchdata uninitialized
+        jit_prepare_routine_call(jit, ctx, REG0);
+
+        // call rb_backref_get()
+        ADD_COMMENT(cb, "rb_backref_get");
+        call_ptr(cb, REG0, (void *)rb_backref_get);
+        mov(cb, C_ARG_REGS[0], RAX);
+
+        switch (type >> 1) {
+            case '&':
+                ADD_COMMENT(cb, "rb_reg_last_match");
+                call_ptr(cb, REG0, (void *)rb_reg_last_match);
+                break;
+            case '`':
+                ADD_COMMENT(cb, "rb_reg_match_pre");
+                call_ptr(cb, REG0, (void *)rb_reg_match_pre);
+                break;
+            case '\'':
+                ADD_COMMENT(cb, "rb_reg_match_post");
+                call_ptr(cb, REG0, (void *)rb_reg_match_post);
+                break;
+            case '+':
+                ADD_COMMENT(cb, "rb_reg_match_last");
+                call_ptr(cb, REG0, (void *)rb_reg_match_last);
+                break;
+            default:
+                rb_bug("invalid back-ref");
+        }
+
+        x86opnd_t stack_ret = ctx_stack_push(ctx, TYPE_UNKNOWN);
+        mov(cb, stack_ret, RAX);
+
+        return YJIT_KEEP_COMPILING;
+    } else {
+        // Fetch the N-th match from the last backref based on type shifted by 1
+
+        // Can raise if matchdata uninitialized
+        jit_prepare_routine_call(jit, ctx, REG0);
+
+        // call rb_backref_get()
+        ADD_COMMENT(cb, "rb_backref_get");
+        call_ptr(cb, REG0, (void *)rb_backref_get);
+
+        // rb_reg_nth_match((int)(type >> 1), backref);
+        ADD_COMMENT(cb, "rb_reg_nth_match");
+        mov(cb, C_ARG_REGS[0], imm_opnd(type >> 1));
+        mov(cb, C_ARG_REGS[1], RAX);
+        call_ptr(cb, REG0, (void *)rb_reg_nth_match);
+
+        x86opnd_t stack_ret = ctx_stack_push(ctx, TYPE_UNKNOWN);
+        mov(cb, stack_ret, RAX);
+
+        return YJIT_KEEP_COMPILING;
+    }
+}
+
+static codegen_status_t
+gen_opt_getinlinecache(jitstate_t* jit, ctx_t* ctx, codeblock_t* cb)
 {
     VALUE jump_offset = jit_get_arg(jit, 0);
     VALUE const_cache_as_value = jit_get_arg(jit, 1);
     IC ic = (IC)const_cache_as_value;
 
-    // See vm_ic_hit_p().
+    // See vm_ic_hit_p(). The same conditions are checked in yjit_constant_ic_update().
     struct iseq_inline_constant_cache_entry *ice = ic->entry;
     if (!ice || // cache not filled
         ice->ic_serial != ruby_vm_global_constant_state || // cache out of date
@@ -3747,6 +4136,7 @@ gen_opt_getinlinecache(jitstate_t *jit, ctx_t *ctx)
     // Jump over the code for filling the cache
     uint32_t jump_idx = jit_next_insn_idx(jit) + (int32_t)jump_offset;
     gen_direct_jump(
+        cb,
         jit->block,
         ctx,
         (blockid_t){ .iseq = jit->iseq, .idx = jump_idx }
@@ -3759,7 +4149,7 @@ gen_opt_getinlinecache(jitstate_t *jit, ctx_t *ctx)
 // interpreter's scheme for avoiding Proc allocations when delegating
 // explict block parameters.
 static codegen_status_t
-gen_getblockparamproxy(jitstate_t *jit, ctx_t *ctx)
+gen_getblockparamproxy(jitstate_t* jit, ctx_t* ctx, codeblock_t* cb)
 {
     // A mirror of the interpreter code. Checking for the case
     // where it's pushing rb_block_param_proxy.
@@ -3800,16 +4190,51 @@ gen_getblockparamproxy(jitstate_t *jit, ctx_t *ctx)
     return YJIT_KEEP_COMPILING;
 }
 
+static codegen_status_t
+gen_invokebuiltin(jitstate_t* jit, ctx_t* ctx, codeblock_t* cb)
+{
+    const struct rb_builtin_function *bf = (struct rb_builtin_function *)jit_get_arg(jit, 0);
+
+    // ec, self, and arguments
+    if (bf->argc + 2 > NUM_C_ARG_REGS) {
+        return YJIT_CANT_COMPILE;
+    }
+
+    // If the calls don't allocate, do they need up to date PC, SP?
+    jit_prepare_routine_call(jit, ctx, REG0);
+
+    // Call the builtin func (ec, recv, arg1, arg2, ...)
+    mov(cb, C_ARG_REGS[0], REG_EC);
+    mov(cb, C_ARG_REGS[1], member_opnd(REG_CFP, rb_control_frame_t, self));
+
+    // Copy arguments from locals
+    for (int32_t i = 0; i < bf->argc; i++) {
+        x86opnd_t stack_opnd = ctx_stack_opnd(ctx, bf->argc - i - 1);
+        x86opnd_t c_arg_reg = C_ARG_REGS[2 + i];
+        mov(cb, c_arg_reg, stack_opnd);
+    }
+
+    call_ptr(cb, REG0, (void *)bf->func_ptr);
+
+    // Push the return value
+    ctx_stack_pop(ctx, bf->argc);
+    x86opnd_t stack_ret = ctx_stack_push(ctx, TYPE_UNKNOWN);
+    mov(cb, stack_ret, RAX);
+
+    return YJIT_KEEP_COMPILING;
+}
+
 // opt_invokebuiltin_delegate calls a builtin function, like
 // invokebuiltin does, but instead of taking arguments from the top of the
 // stack uses the argument locals (and self) from the current method.
 static codegen_status_t
-gen_opt_invokebuiltin_delegate(jitstate_t *jit, ctx_t *ctx)
+gen_opt_invokebuiltin_delegate(jitstate_t* jit, ctx_t* ctx, codeblock_t* cb)
 {
     const struct rb_builtin_function *bf = (struct rb_builtin_function *)jit_get_arg(jit, 0);
     int32_t start_index = (int32_t)jit_get_arg(jit, 1);
 
-    if (bf->argc + 2 >= NUM_C_ARG_REGS) {
+    // ec, self, and arguments
+    if (bf->argc + 2 > NUM_C_ARG_REGS) {
         return YJIT_CANT_COMPILE;
     }
 
@@ -3886,13 +4311,20 @@ yjit_tracing_invalidate_all(void)
     }
     cb_set_pos(cb, old_pos);
 
+
+
+    // FIXME:
+    // FIXME: yjit_codepage_frozen_bytes no longer exists
+    // FIXME:
+
+
     // Freeze invalidated part of the codepage. We only want to wait for
     // running instances of the code to exit from now on, so we shouldn't
     // change the code. There could be other ractors sleeping in
     // branch_stub_hit(), for example. We could harden this by changing memory
     // protection on the frozen range.
-    RUBY_ASSERT_ALWAYS(yjit_codepage_frozen_bytes <= old_pos && "frozen bytes should increase monotonically");
-    yjit_codepage_frozen_bytes = old_pos;
+    //RUBY_ASSERT_ALWAYS(yjit_codepage_frozen_bytes <= old_pos && "frozen bytes should increase monotonically");
+    //yjit_codepage_frozen_bytes = old_pos;
 
     RB_VM_LOCK_LEAVE();
 }
@@ -3977,15 +4409,8 @@ yjit_reg_op(int opcode, codegen_fn gen_fn)
 void
 yjit_init_codegen(void)
 {
-    // Initialize the code blocks
-    uint32_t mem_size = rb_yjit_opts.exec_mem_size * 1024 * 1024;
-    uint8_t *mem_block = alloc_exec_mem(mem_size);
-
-    cb = &block;
-    cb_init(cb, mem_block, mem_size/2);
-
-    ocb = &outline_block;
-    cb_init(ocb, mem_block + mem_size/2, mem_size/2);
+    // Allocate the first code page
+    yjit_new_code_page();
 
     // Generate the interpreter exit code for leave
     leave_exit_code = yjit_gen_leave_exit(cb);
@@ -4007,6 +4432,7 @@ yjit_init_codegen(void)
     yjit_reg_op(BIN(splatarray), gen_splatarray);
     yjit_reg_op(BIN(expandarray), gen_expandarray);
     yjit_reg_op(BIN(newhash), gen_newhash);
+    yjit_reg_op(BIN(newrange), gen_newrange);
     yjit_reg_op(BIN(concatstrings), gen_concatstrings);
     yjit_reg_op(BIN(putnil), gen_putnil);
     yjit_reg_op(BIN(putobject), gen_putobject);
@@ -4018,7 +4444,9 @@ yjit_init_codegen(void)
     yjit_reg_op(BIN(getlocal), gen_getlocal);
     yjit_reg_op(BIN(getlocal_WC_0), gen_getlocal_wc0);
     yjit_reg_op(BIN(getlocal_WC_1), gen_getlocal_wc1);
+    yjit_reg_op(BIN(setlocal), gen_setlocal);
     yjit_reg_op(BIN(setlocal_WC_0), gen_setlocal_wc0);
+    yjit_reg_op(BIN(setlocal_WC_1), gen_setlocal_wc1);
     yjit_reg_op(BIN(getinstancevariable), gen_getinstancevariable);
     yjit_reg_op(BIN(setinstancevariable), gen_setinstancevariable);
     yjit_reg_op(BIN(defined), gen_defined);
@@ -4048,8 +4476,10 @@ yjit_init_codegen(void)
     yjit_reg_op(BIN(opt_length), gen_opt_length);
     yjit_reg_op(BIN(opt_regexpmatch2), gen_opt_regexpmatch2);
     yjit_reg_op(BIN(opt_getinlinecache), gen_opt_getinlinecache);
+    yjit_reg_op(BIN(invokebuiltin), gen_invokebuiltin);
     yjit_reg_op(BIN(opt_invokebuiltin_delegate), gen_opt_invokebuiltin_delegate);
     yjit_reg_op(BIN(opt_invokebuiltin_delegate_leave), gen_opt_invokebuiltin_delegate);
+    yjit_reg_op(BIN(opt_case_dispatch), gen_opt_case_dispatch);
     yjit_reg_op(BIN(branchif), gen_branchif);
     yjit_reg_op(BIN(branchunless), gen_branchunless);
     yjit_reg_op(BIN(branchnil), gen_branchnil);
@@ -4057,13 +4487,25 @@ yjit_init_codegen(void)
     yjit_reg_op(BIN(getblockparamproxy), gen_getblockparamproxy);
     yjit_reg_op(BIN(opt_send_without_block), gen_opt_send_without_block);
     yjit_reg_op(BIN(send), gen_send);
+    yjit_reg_op(BIN(invokesuper), gen_invokesuper);
     yjit_reg_op(BIN(leave), gen_leave);
     yjit_reg_op(BIN(getglobal), gen_getglobal);
     yjit_reg_op(BIN(setglobal), gen_setglobal);
     yjit_reg_op(BIN(tostring), gen_tostring);
     yjit_reg_op(BIN(toregexp), gen_toregexp);
+    yjit_reg_op(BIN(getspecial), gen_getspecial);
 
     yjit_method_codegen_table = st_init_numtable();
 
     yjit_reg_method(rb_cBasicObject, "!", jit_rb_obj_not);
+
+    yjit_reg_method(rb_cNilClass, "nil?", jit_rb_true);
+    yjit_reg_method(rb_mKernel, "nil?", jit_rb_false);
+
+    yjit_reg_method(rb_cBasicObject, "==", jit_rb_obj_equal);
+    yjit_reg_method(rb_cBasicObject, "equal?", jit_rb_obj_equal);
+    yjit_reg_method(rb_mKernel, "eql?", jit_rb_obj_equal);
+    yjit_reg_method(rb_cModule, "==", jit_rb_obj_equal);
+    yjit_reg_method(rb_cSymbol, "==", jit_rb_obj_equal);
+    yjit_reg_method(rb_cSymbol, "===", jit_rb_obj_equal);
 }

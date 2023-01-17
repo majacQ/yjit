@@ -1369,6 +1369,28 @@ rb_vm_setinstancevariable(const rb_iseq_t *iseq, VALUE obj, ID id, VALUE val, IV
     vm_setinstancevariable(iseq, obj, id, val, ic);
 }
 
+/* Set the instance variable +val+ on object +obj+ at the +index+.
+ * This function only works with T_OBJECT objects, so make sure
+ * +obj+ is of type T_OBJECT before using this function.
+ */
+VALUE
+rb_vm_set_ivar_idx(VALUE obj, uint32_t index, VALUE val)
+{
+    RUBY_ASSERT(RB_TYPE_P(obj, T_OBJECT));
+
+    rb_check_frozen_internal(obj);
+
+    VM_ASSERT(!rb_ractor_shareable_p(obj));
+
+    if (UNLIKELY(index >= ROBJECT_NUMIV(obj))) {
+        rb_init_iv_list(obj);
+    }
+    VALUE *ptr = ROBJECT_IVPTR(obj);
+    RB_OBJ_WRITE(obj, &ptr[index], val);
+
+    return val;
+}
+
 static VALUE
 vm_throw_continue(const rb_execution_context_t *ec, VALUE err)
 {
@@ -2035,12 +2057,6 @@ opt_equality_specialized(VALUE recv, VALUE obj)
 
   compare_by_identity:
     return RBOOL(recv == obj);
-}
-
-VALUE
-rb_opt_equality_specialized(VALUE recv, VALUE obj)
-{
-    return opt_equality_specialized(recv, obj);
 }
 
 static VALUE
@@ -5220,12 +5236,6 @@ vm_opt_aset(VALUE recv, VALUE obj, VALUE set)
     else {
 	return Qundef;
     }
-}
-
-VALUE
-rb_vm_opt_aset(VALUE recv, VALUE obj, VALUE set)
-{
-    return vm_opt_aset(recv, obj, set);
 }
 
 static VALUE

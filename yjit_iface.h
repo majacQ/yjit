@@ -6,8 +6,9 @@
 #ifndef YJIT_IFACE_H
 #define YJIT_IFACE_H 1
 
-#include "ruby/ruby.h"
-#include "ruby/assert.h" // for RUBY_DEBUG
+#include "ruby/internal/config.h"
+#include "ruby_assert.h" // for RUBY_DEBUG
+#include "yjit.h" // for YJIT_STATS
 #include "vm_core.h"
 #include "yjit_core.h"
 
@@ -15,8 +16,7 @@
 # define YJIT_DEFAULT_CALL_THRESHOLD 10
 #endif
 
-#if RUBY_DEBUG
-# define YJIT_STATS 1
+#if YJIT_STATS
 struct yjit_comment {
     uint32_t offset;
     const char *comment;
@@ -25,11 +25,7 @@ struct yjit_comment {
 typedef rb_darray(struct yjit_comment) yjit_comment_array_t;
 
 extern yjit_comment_array_t yjit_code_comments;
-#else
-# ifndef YJIT_STATS
-#  define YJIT_STATS 0
-# endif // ifndef YJIT_STATS
-#endif // if RUBY_DEBUG
+#endif // if YJIT_STATS
 
 
 #if YJIT_STATS
@@ -66,6 +62,9 @@ YJIT_DECLARE_COUNTERS(
 
     traced_cfunc_return,
 
+    invokesuper_me_changed,
+    invokesuper_block,
+
     leave_se_interrupt,
     leave_interp_return,
     leave_start_pc_non_zero,
@@ -88,6 +87,9 @@ YJIT_DECLARE_COUNTERS(
 
     vm_insns_count,
     compiled_iseq_count,
+    compiled_block_count,
+    invalidation_count,
+    constant_state_bumps,
 
     expandarray_splat,
     expandarray_postarg,
@@ -100,10 +102,13 @@ YJIT_DECLARE_COUNTERS(
 
 #undef YJIT_DECLARE_COUNTERS
 
+RUBY_EXTERN struct rb_yjit_runtime_counters yjit_runtime_counters;
+
 #endif // YJIT_STATS
 
+RUBY_EXTERN VALUE yjit_cur_code_page;
+
 RUBY_EXTERN struct rb_yjit_options rb_yjit_opts;
-RUBY_EXTERN struct rb_yjit_runtime_counters yjit_runtime_counters;
 
 void yjit_map_addr2insn(void *code_ptr, int insn);
 VALUE *yjit_iseq_pc_at_idx(const rb_iseq_t *iseq, uint32_t insn_idx);
@@ -123,5 +128,10 @@ const VALUE *rb_yjit_count_side_exit_op(const VALUE *exit_pc);
 void yjit_unlink_method_lookup_dependency(block_t *block);
 void yjit_block_assumptions_free(block_t *block);
 VALUE yjit_wrap_block(block_t * block);
+
+VALUE rb_yjit_code_page_alloc(void);
+code_page_t *rb_yjit_code_page_unwrap(VALUE cp_obj);
+void rb_yjit_get_cb(codeblock_t* cb, uint8_t* code_ptr);
+void rb_yjit_get_ocb(codeblock_t* cb, uint8_t* code_ptr);
 
 #endif // #ifndef YJIT_IFACE_H

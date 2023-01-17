@@ -36,6 +36,14 @@ class TestYJIT < Test::Unit::TestCase
     assert_compiles('[1, 2, 3]', insns: %i[duparray], result: [1, 2, 3])
   end
 
+  def test_compile_newrange
+    assert_compiles('s = 1; (s..5)', insns: %i[newrange], result: 1..5)
+    assert_compiles('s = 1; e = 5; (s..e)', insns: %i[newrange], result: 1..5)
+    assert_compiles('s = 1; (s...5)', insns: %i[newrange], result: 1...5)
+    assert_compiles('s = 1; (s..)', insns: %i[newrange], result: 1..)
+    assert_compiles('e = 5; (..e)', insns: %i[newrange], result: ..5)
+  end
+
   def test_compile_opt_nil_p
     assert_compiles('nil.nil?', insns: %i[opt_nil_p], result: true)
     assert_compiles('false.nil?', insns: %i[opt_nil_p], result: false)
@@ -55,6 +63,89 @@ class TestYJIT < Test::Unit::TestCase
     assert_compiles('-"foo" == -"bar"', insns: %i[opt_eq], result: false)
   end
 
+  def test_compile_eq_symbol
+    assert_compiles(':foo == :foo', insns: %i[opt_eq], result: true)
+    assert_compiles(':foo == :bar', insns: %i[opt_eq], result: false)
+    assert_compiles(':foo == "foo".to_sym', insns: %i[opt_eq], result: true)
+  end
+
+  def test_compile_eq_object
+    assert_compiles(<<~RUBY, insns: %i[opt_eq], result: false)
+      def eq(a, b)
+        a == b
+      end
+
+      eq(Object.new, Object.new)
+    RUBY
+
+    assert_compiles(<<~RUBY, insns: %i[opt_eq], result: true)
+      def eq(a, b)
+        a == b
+      end
+
+      obj = Object.new
+      eq(obj, obj)
+    RUBY
+  end
+
+  def test_compile_eq_arbitrary_class
+    assert_compiles(<<~RUBY, insns: %i[opt_eq], result: "yes")
+      def eq(a, b)
+        a == b
+      end
+
+      class Foo
+        def ==(other)
+          "yes"
+        end
+      end
+
+      eq(Foo.new, Foo.new)
+      eq(Foo.new, Foo.new)
+    RUBY
+  end
+
+  def test_compile_opt_lt
+    assert_compiles('1 < 2', insns: %i[opt_lt])
+    assert_compiles('"a" < "b"', insns: %i[opt_lt])
+  end
+
+  def test_compile_opt_le
+    assert_compiles('1 <= 2', insns: %i[opt_le])
+    assert_compiles('"a" <= "b"', insns: %i[opt_le])
+  end
+
+  def test_compile_opt_gt
+    assert_compiles('1 > 2', insns: %i[opt_gt])
+    assert_compiles('"a" > "b"', insns: %i[opt_gt])
+  end
+
+  def test_compile_opt_ge
+    assert_compiles('1 >= 2', insns: %i[opt_ge])
+    assert_compiles('"a" >= "b"', insns: %i[opt_ge])
+  end
+
+  def test_compile_opt_plus
+    assert_compiles('1 + 2', insns: %i[opt_plus])
+    assert_compiles('"a" + "b"', insns: %i[opt_plus])
+    assert_compiles('[:foo] + [:bar]', insns: %i[opt_plus])
+  end
+
+  def test_compile_opt_minus
+    assert_compiles('1 - 2', insns: %i[opt_minus])
+    assert_compiles('[:foo, :bar] - [:bar]', insns: %i[opt_minus])
+  end
+
+  def test_compile_opt_or
+    assert_compiles('1 | 2', insns: %i[opt_or])
+    assert_compiles('[:foo] | [:bar]', insns: %i[opt_or])
+  end
+
+  def test_compile_opt_and
+    assert_compiles('1 & 2', insns: %i[opt_and])
+    assert_compiles('[:foo, :bar] & [:bar]', insns: %i[opt_and])
+  end
+
   def test_compile_set_and_get_global
     assert_compiles('$foo = 123; $foo', insns: %i[setglobal], result: 123)
   end
@@ -65,6 +156,27 @@ class TestYJIT < Test::Unit::TestCase
 
   def test_compile_tostring
     assert_no_exits('"i am a string #{true}"')
+  end
+
+  def test_compile_opt_aset
+    assert_compiles('[1,2,3][2] = 4', insns: %i[opt_aset])
+    assert_compiles('{}[:foo] = :bar', insns: %i[opt_aset])
+    assert_compiles('[1,2,3][0..-1] = []', insns: %i[opt_aset])
+    assert_compiles('"foo"[3] = "d"', insns: %i[opt_aset])
+  end
+
+  def test_compile_attr_set
+    assert_no_exits(<<~EORB)
+    class Foo
+      attr_accessor :bar
+    end
+
+    foo = Foo.new
+    foo.bar = 3
+    foo.bar = 3
+    foo.bar = 3
+    foo.bar = 3
+    EORB
   end
 
   def test_compile_regexp
@@ -82,6 +194,20 @@ class TestYJIT < Test::Unit::TestCase
       end
 
       foo(5, 2)
+    RUBY
+  end
+
+  def test_setlocal_with_level
+    assert_no_exits(<<~RUBY)
+      def sum(arr)
+        sum = 0
+        arr.each do |x|
+          sum += x
+        end
+        sum
+      end
+
+      sum([1,2,3])
     RUBY
   end
 
@@ -128,6 +254,28 @@ class TestYJIT < Test::Unit::TestCase
     RUBY
   end
 
+  def test_expandarray
+    assert_compiles(<<~'RUBY', insns: %i[expandarray], result: [1, 2])
+      a, b = [1, 2]
+    RUBY
+  end
+
+  def test_expandarray_nil
+    assert_compiles(<<~'RUBY', insns: %i[expandarray], result: [nil, nil])
+      a, b = nil
+      [a, b]
+    RUBY
+  end
+
+  def test_getspecial_backref
+    assert_compiles("'foo' =~ /(o)./; $&", insns: %i[getspecial], result: "oo")
+    assert_compiles("'foo' =~ /(o)./; $`", insns: %i[getspecial], result: "f")
+    assert_compiles("'foo' =~ /(o)./; $'", insns: %i[getspecial], result: "")
+    assert_compiles("'foo' =~ /(o)./; $+", insns: %i[getspecial], result: "o")
+    assert_compiles("'foo' =~ /(o)./; $1", insns: %i[getspecial], result: "o")
+    assert_compiles("'foo' =~ /(o)./; $2", insns: %i[getspecial], result: nil)
+  end
+
   def test_compile_opt_getinlinecache
     assert_compiles(<<~RUBY, insns: %i[opt_getinlinecache], result: 123, min_calls: 2)
       def get_foo
@@ -162,6 +310,67 @@ class TestYJIT < Test::Unit::TestCase
     RUBY
   end
 
+  def test_invokebuiltin
+    assert_compiles(<<~RUBY)
+      def foo(obj)
+        obj.foo = 123
+        obj.bar = 123
+      end
+
+      Foo = Struct.new(:foo, :bar)
+      foo(Foo.new(123))
+      foo(Foo.new(123))
+    RUBY
+  end
+
+  def test_super_iseq
+    assert_compiles(<<~'RUBY', insns: %i[invokesuper opt_plus opt_mult], result: 15)
+      class A
+        def foo
+          1 + 2
+        end
+      end
+
+      class B < A
+        def foo
+          super * 5
+        end
+      end
+
+      B.new.foo
+    RUBY
+  end
+
+  def test_super_cfunc
+    assert_compiles(<<~'RUBY', insns: %i[invokesuper], result: "Hello")
+      class Gnirts < String
+        def initialize
+          super(-"olleH")
+        end
+
+        def to_s
+          super().reverse
+        end
+      end
+
+      Gnirts.new.to_s
+    RUBY
+  end
+
+  # Tests calling a variadic cfunc with many args
+  def test_build_large_struct
+    assert_compiles(<<~RUBY, insns: %i[opt_send_without_block], min_calls: 2)
+      ::Foo = Struct.new(:a, :b, :c, :d, :e, :f, :g, :h)
+
+      def build_foo
+        ::Foo.new(:a, :b, :c, :d, :e, :f, :g, :h)
+      end
+
+      build_foo
+      build_foo
+    RUBY
+  end
+
   def test_fib_recursion
     assert_compiles(<<~'RUBY', insns: %i[opt_le opt_minus opt_plus opt_send_without_block], result: 34)
       def fib(n)
@@ -182,6 +391,31 @@ class TestYJIT < Test::Unit::TestCase
 
       foo(nil)
       foo("example.com")
+    RUBY
+  end
+
+  def test_no_excessive_opt_getinlinecache_invalidation
+    assert_compiles(<<~'RUBY', exits: :any, result: :ok)
+      objects = [Object.new, Object.new]
+
+      objects.each do |o|
+        class << o
+          def foo
+            Object
+          end
+        end
+      end
+
+      9000.times {
+        objects[0].foo
+        objects[1].foo
+      }
+
+      stats = YJIT.runtime_stats
+      return :ok unless stats[:all_stats]
+      return :ok if stats[:invalidation_count] < 10
+
+      :fail
     RUBY
   end
 
@@ -228,7 +462,7 @@ class TestYJIT < Test::Unit::TestCase
 
     script = <<~RUBY
       #{"# frozen_string_literal: true" if frozen_string_literal}
-      _test_proc = proc {
+      _test_proc = -> {
         #{test_script}
       }
       #{reset_stats}

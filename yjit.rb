@@ -148,10 +148,6 @@ module YJIT
     Primitive.cexpr! 'rb_yjit_opts.gen_stats ? Qtrue : Qfalse'
   end
 
-  def self.stats_enabled=(enabled)
-    Primitive.set_stats_enabled(enabled)
-  end
-
   def self.enabled?
     Primitive.cexpr! 'rb_yjit_enabled_p() ? Qtrue : Qfalse'
   end
@@ -165,20 +161,21 @@ module YJIT
       return unless stats
 
       $stderr.puts("***YJIT: Printing YJIT statistics on exit***")
-      $stderr.puts("Number of bindings allocated: %d\n" % stats[:binding_allocations])
-      $stderr.puts("Number of locals modified through binding: %d\n" % stats[:binding_set])
 
       print_counters(stats, prefix: 'send_', prompt: 'method call exit reasons: ')
+      print_counters(stats, prefix: 'invokesuper_', prompt: 'invokesuper exit reasons: ')
       print_counters(stats, prefix: 'leave_', prompt: 'leave exit reasons: ')
       print_counters(stats, prefix: 'getivar_', prompt: 'getinstancevariable exit reasons:')
       print_counters(stats, prefix: 'setivar_', prompt: 'setinstancevariable exit reasons:')
       print_counters(stats, prefix: 'oaref_', prompt: 'opt_aref exit reasons: ')
       print_counters(stats, prefix: 'expandarray_', prompt: 'expandarray exit reasons: ')
 
-      total_exits = total_exit_count(stats)
+      side_exits = total_exit_count(stats)
+      total_exits = side_exits + stats[:leave_interp_return]
 
-      # Number of instructions that finish executing in YJIT
-      retired_in_yjit = stats[:exec_instruction] - total_exits
+      # Number of instructions that finish executing in YJIT.
+      # See :count-placement: about the subtraction.
+      retired_in_yjit = stats[:exec_instruction] - side_exits
 
       # Average length of instruction sequences executed by YJIT
       avg_len_in_yjit = retired_in_yjit.to_f / total_exits
@@ -187,7 +184,12 @@ module YJIT
       total_insns_count = retired_in_yjit + stats[:vm_insns_count]
       yjit_ratio_pct = 100.0 * retired_in_yjit.to_f / total_insns_count
 
+      $stderr.puts "bindings_allocations:  " + ("%10d" % stats[:binding_allocations])
+      $stderr.puts "bindings_set:          " + ("%10d" % stats[:binding_set])
       $stderr.puts "compiled_iseq_count:   " + ("%10d" % stats[:compiled_iseq_count])
+      $stderr.puts "compiled_block_count:  " + ("%10d" % stats[:compiled_block_count])
+      $stderr.puts "invalidation_count:    " + ("%10d" % stats[:invalidation_count])
+      $stderr.puts "constant_state_bumps:  " + ("%10d" % stats[:constant_state_bumps])
       $stderr.puts "inline_code_size:      " + ("%10d" % stats[:inline_code_size])
       $stderr.puts "outlined_code_size:    " + ("%10d" % stats[:outlined_code_size])
 
@@ -224,7 +226,7 @@ module YJIT
         padded_count = "%10d" % count
         percent = 100.0 * count / total_exits
         formatted_percent = "%.1f" % percent
-        $stderr.puts("#{padded_name}: #{padded_count} (#{formatted_percent})" )
+        $stderr.puts("#{padded_name}: #{padded_count} (#{formatted_percent}%)" )
       end
     end
 

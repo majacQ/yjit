@@ -24,13 +24,8 @@ static VALUE cYjitDisasmInsn;
 static VALUE mYjit;
 static VALUE cYjitBlock;
 
-#if RUBY_DEBUG
-# define YJIT_STATS 1
+#if YJIT_STATS
 static VALUE cYjitCodeComment;
-#else
-# ifndef YJIT_STATS
-#  define YJIT_STATS 0
-# endif
 #endif
 
 #if YJIT_STATS
@@ -42,6 +37,9 @@ struct rb_yjit_runtime_counters yjit_runtime_counters = { 0 };
 // Machine code blocks (executable memory)
 extern codeblock_t *cb;
 extern codeblock_t *ocb;
+
+// Current code page we are writing machine code into
+VALUE yjit_cur_code_page = Qfalse;
 
 // Hash table of encoded instructions
 extern st_table *rb_encoded_insn_data;
@@ -317,17 +315,17 @@ add_lookup_dependency_i(st_data_t *key, st_data_t *value, st_data_t data, int ex
 void
 assume_method_lookup_stable(VALUE receiver_klass, const rb_callable_method_entry_t *cme, block_t *block)
 {
-    RUBY_ASSERT(!block->receiver_klass && !block->callee_cme);
     RUBY_ASSERT(cme_validity_dependency);
     RUBY_ASSERT(method_lookup_dependency);
     RUBY_ASSERT(rb_callable_method_entry(receiver_klass, cme->called_id) == cme);
-    RUBY_ASSERT_ALWAYS(RB_TYPE_P(receiver_klass, T_CLASS));
+    RUBY_ASSERT_ALWAYS(RB_TYPE_P(receiver_klass, T_CLASS) || RB_TYPE_P(receiver_klass, T_ICLASS));
     RUBY_ASSERT_ALWAYS(!rb_objspace_garbage_object_p(receiver_klass));
 
-    block->callee_cme = (VALUE)cme;
+    cme_dependency_t cme_dep = { receiver_klass, (VALUE)cme };
+    rb_darray_append(&block->cme_dependencies, cme_dep);
+
     st_update(cme_validity_dependency, (st_data_t)cme, add_cme_validity_dependency_i, (st_data_t)block);
 
-    block->receiver_klass = receiver_klass;
     struct lookup_dependency_insertion info = { block, cme->called_id };
     st_update(method_lookup_dependency, (st_data_t)receiver_klass, add_lookup_dependency_i, (st_data_t)&info);
 }
@@ -382,6 +380,8 @@ yjit_root_mark(void *ptr)
         // references.
         st_foreach(cme_validity_dependency, mark_and_pin_keys_i, 0);
     }
+
+    rb_gc_mark(yjit_cur_code_page);
 }
 
 static void
@@ -485,17 +485,16 @@ rb_yjit_invalidate_all_method_lookup_assumptions(void)
 
 // Remove a block from the method lookup dependency table
 static void
-remove_method_lookup_dependency(block_t *block)
+remove_method_lookup_dependency(block_t *block, VALUE receiver_klass, const rb_callable_method_entry_t *callee_cme)
 {
-    if (!block->receiver_klass) return;
-    RUBY_ASSERT(block->callee_cme); // callee_cme should be set when receiver_klass is set
+    RUBY_ASSERT(receiver_klass);
+    RUBY_ASSERT(callee_cme); // callee_cme should be set when receiver_klass is set
 
     st_data_t image;
-    st_data_t key = (st_data_t)block->receiver_klass;
+    st_data_t key = (st_data_t)receiver_klass;
     if (st_lookup(method_lookup_dependency, key, &image)) {
         struct rb_id_table *id2blocks = (void *)image;
-        const rb_callable_method_entry_t *cme = (void *)block->callee_cme;
-        ID mid = cme->called_id;
+        ID mid = callee_cme->called_id;
 
         // Find block set
         VALUE blocks;
@@ -517,12 +516,12 @@ remove_method_lookup_dependency(block_t *block)
 
 // Remove a block from cme_validity_dependency
 static void
-remove_cme_validity_dependency(block_t *block)
+remove_cme_validity_dependency(block_t *block, const rb_callable_method_entry_t *callee_cme)
 {
-    if (!block->callee_cme) return;
+    RUBY_ASSERT(callee_cme);
 
     st_data_t blocks;
-    if (st_lookup(cme_validity_dependency, block->callee_cme, &blocks)) {
+    if (st_lookup(cme_validity_dependency, (st_data_t)callee_cme, &blocks)) {
         st_table *block_set = (st_table *)blocks;
 
         st_data_t block_as_st_data = (st_data_t)block;
@@ -533,8 +532,12 @@ remove_cme_validity_dependency(block_t *block)
 void
 yjit_unlink_method_lookup_dependency(block_t *block)
 {
-    remove_method_lookup_dependency(block);
-    remove_cme_validity_dependency(block);
+    cme_dependency_t *cme_dep;
+    rb_darray_foreach(block->cme_dependencies, cme_dependency_idx, cme_dep) {
+        remove_method_lookup_dependency(block, cme_dep->receiver_klass, (const rb_callable_method_entry_t *)cme_dep->callee_cme);
+        remove_cme_validity_dependency(block, (const rb_callable_method_entry_t *)cme_dep->callee_cme);
+    }
+    rb_darray_free(block->cme_dependencies);
 }
 
 void
@@ -649,7 +652,7 @@ block_address(VALUE self)
 {
     block_t * block;
     TypedData_Get_Struct(self, block_t, &yjit_block_type, block);
-    uint8_t* code_addr = cb_get_ptr(cb, block->start_pos);
+    uint8_t* code_addr = block->start_pos;
     return LONG2NUM((intptr_t)code_addr);
 }
 
@@ -661,7 +664,7 @@ block_code(VALUE self)
     TypedData_Get_Struct(self, block_t, &yjit_block_type, block);
 
     return (VALUE)rb_str_new(
-        (const char*)cb->mem_block + block->start_pos,
+        (const char*)block->start_pos,
         block->end_pos - block->start_pos
     );
 }
@@ -710,13 +713,24 @@ rb_yjit_constant_state_changed(void)
 {
     if (blocks_assuming_stable_global_constant_state) {
         st_foreach(blocks_assuming_stable_global_constant_state, block_invalidation_iterator, 0);
+#if YJIT_STATS
+        yjit_runtime_counters.constant_state_bumps++;
+#endif
     }
 }
 
-// Callback from the opt_setinlinecache instruction in the interpreter
+// Callback from the opt_setinlinecache instruction in the interpreter.
+// Invalidate the block for the matching opt_getinlinecache so it could regenerate code
+// using the new value in the constant cache.
 void
 yjit_constant_ic_update(const rb_iseq_t *iseq, IC ic)
 {
+    // We can't generate code in these situations, so no need to invalidate.
+    // See gen_opt_getinlinecache.
+    if (ic->entry->ic_cref || rb_multi_ractor_p()) {
+        return;
+    }
+
     RB_VM_LOCK_ENTER();
     rb_vm_barrier(); // Stop other ractors since we are going to patch machine code.
     {
@@ -925,13 +939,6 @@ reset_stats_bang(rb_execution_context_t *ec, VALUE self)
     return Qnil;
 }
 
-static VALUE
-set_stats_enabled(rb_execution_context_t *ec, VALUE self, VALUE enabled)
-{
-    rb_yjit_opts.gen_stats = RB_TEST(enabled);
-    return enabled;
-}
-
 #include "yjit.rbinc"
 
 #if YJIT_STATS
@@ -973,8 +980,36 @@ rb_yjit_iseq_mark(const struct rb_iseq_constant_body *body)
         rb_darray_for(version_array, block_idx) {
             block_t *block = rb_darray_get(version_array, block_idx);
 
+  <<<<<<< block-wrappers
             // Mark all associated blocks
             rb_gc_mark_movable((VALUE)block->self);
+  =======
+            rb_gc_mark_movable((VALUE)block->blockid.iseq);
+
+            cme_dependency_t *cme_dep;
+            rb_darray_foreach(block->cme_dependencies, cme_dependency_idx, cme_dep) {
+                rb_gc_mark_movable(cme_dep->receiver_klass);
+                rb_gc_mark_movable(cme_dep->callee_cme);
+            }
+
+            // Mark outgoing branch entries
+            rb_darray_for(block->outgoing, branch_idx) {
+                branch_t* branch = rb_darray_get(block->outgoing, branch_idx);
+                for (int i = 0; i < 2; ++i) {
+                    rb_gc_mark_movable((VALUE)branch->targets[i].iseq);
+                }
+            }
+
+            // Walk over references to objects in generated code.
+            uint8_t **offset_element;
+            rb_darray_foreach(block->gc_object_offsets, offset_idx, offset_element) {
+                uint8_t *value_address = *offset_element;
+
+                VALUE object;
+                memcpy(&object, value_address, SIZEOF_VALUE);
+                rb_gc_mark_movable(object);
+            }
+  >>>>>>> code_pages_the_sequel
         }
     }
 }
@@ -983,6 +1018,7 @@ rb_yjit_iseq_mark(const struct rb_iseq_constant_body *body)
 void
 rb_yjit_mark_iseq_entry_blocks(const rb_iseq_t *iseq)
 {
+  <<<<<<< block-wrappers
     rb_yjit_iseq_mark(iseq->body);
 
     if (rb_darray_size(iseq->body->yjit_blocks) > 0) {
@@ -994,6 +1030,43 @@ rb_yjit_mark_iseq_entry_blocks(const rb_iseq_t *iseq)
 
             // Mark the block wrapper
             rb_gc_mark_movable(block->self);
+  =======
+    rb_darray_for(body->yjit_blocks, version_array_idx) {
+        rb_yjit_block_array_t version_array = rb_darray_get(body->yjit_blocks, version_array_idx);
+
+        rb_darray_for(version_array, block_idx) {
+            block_t *block = rb_darray_get(version_array, block_idx);
+
+            block->blockid.iseq = (const rb_iseq_t *)rb_gc_location((VALUE)block->blockid.iseq);
+
+            cme_dependency_t *cme_dep;
+            rb_darray_foreach(block->cme_dependencies, cme_dependency_idx, cme_dep) {
+                cme_dep->receiver_klass = rb_gc_location(cme_dep->receiver_klass);
+                cme_dep->callee_cme = rb_gc_location(cme_dep->callee_cme);
+            }
+
+            // Update outgoing branch entries
+            rb_darray_for(block->outgoing, branch_idx) {
+                branch_t* branch = rb_darray_get(block->outgoing, branch_idx);
+                for (int i = 0; i < 2; ++i) {
+                    branch->targets[i].iseq = (const void *)rb_gc_location((VALUE)branch->targets[i].iseq);
+                }
+            }
+
+            // Walk over references to objects in generated code.
+            uint8_t **offset_element;
+            rb_darray_foreach(block->gc_object_offsets, offset_idx, offset_element) {
+                uint8_t *value_address = *offset_element;
+
+                VALUE object;
+                memcpy(&object, value_address, SIZEOF_VALUE);
+                VALUE possibly_moved = rb_gc_location(object);
+                // Only write when the VALUE moves, to be CoW friendly.
+                if (possibly_moved != object) {
+                    memcpy(value_address, &possibly_moved, SIZEOF_VALUE);
+                }
+            }
+  >>>>>>> code_pages_the_sequel
         }
     }
 }
@@ -1014,6 +1087,8 @@ rb_yjit_iseq_free(const struct rb_iseq_constant_body *body)
 static void
 yjit_code_page_free(void *code_page)
 {
+    fprintf(stderr, "FREEING CODE PAGE\n");
+
     free_code_page((code_page_t*)code_page);
 }
 
@@ -1029,6 +1104,10 @@ VALUE rb_yjit_code_page_alloc(void)
 {
     code_page_t* code_page = alloc_code_page();
     VALUE cp_obj = TypedData_Wrap_Struct(0, &yjit_code_page_type, code_page);
+
+    // Write a pointer to the wrapper object at the beginning of the code page
+    *((VALUE*)code_page->mem_block) = cp_obj;
+
     return cp_obj;
 }
 
@@ -1038,6 +1117,44 @@ code_page_t *rb_yjit_code_page_unwrap(VALUE cp_obj)
     code_page_t * code_page;
     TypedData_Get_Struct(cp_obj, code_page_t, &yjit_code_page_type, code_page);
     return code_page;
+}
+
+// Get the code page wrapper object for a code pointer
+VALUE rb_yjit_code_page_from_ptr(uint8_t* code_ptr)
+{
+    VALUE* page_start = (VALUE*)((intptr_t)code_ptr & ~(CODE_PAGE_SIZE - 1));
+    VALUE wrapper = *page_start;
+    return wrapper;
+}
+
+// Get the inline code block corresponding to a code pointer
+void rb_yjit_get_cb(codeblock_t* cb, uint8_t* code_ptr)
+{
+    VALUE page_wrapper = rb_yjit_code_page_from_ptr(code_ptr);
+    code_page_t *code_page = rb_yjit_code_page_unwrap(page_wrapper);
+
+    // A pointer to the page wrapper object is written at the start of the code page
+    uint8_t* mem_block = code_page->mem_block + sizeof(VALUE);
+    uint32_t mem_size = (code_page->page_size/2) - sizeof(VALUE);
+    RUBY_ASSERT(mem_block);
+
+    // Map the code block to this memory region
+    cb_init(cb, mem_block, mem_size);
+}
+
+// Get the outlined code block corresponding to a code pointer
+void rb_yjit_get_ocb(codeblock_t* cb, uint8_t* code_ptr)
+{
+    VALUE page_wrapper = rb_yjit_code_page_from_ptr(code_ptr);
+    code_page_t *code_page = rb_yjit_code_page_unwrap(page_wrapper);
+
+    // A pointer to the page wrapper object is written at the start of the code page
+    uint8_t* mem_block = code_page->mem_block + (code_page->page_size/2);
+    uint32_t mem_size = code_page->page_size/2;
+    RUBY_ASSERT(mem_block);
+
+    // Map the code block to this memory region
+    cb_init(cb, mem_block, mem_size);
 }
 
 bool
