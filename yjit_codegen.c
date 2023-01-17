@@ -407,8 +407,13 @@ yjit_gen_leave_exit(codeblock_t *cb)
 {
     uint8_t *code_ptr = cb_get_ptr(cb, cb->write_pos);
 
+  <<<<<<< block-wrappers
+    // Note, gen_leave() fully reconstructs interpreter state and leaves
+    // the return value in RAX before coming here.
+  =======
     // Note, gen_leave() fully reconstructs interpreter state and leaves the
     // return value in RAX before coming here.
+  >>>>>>> code_pages_the_sequel
 
     // Every exit to the interpreter should be counted
     GEN_COUNTER_INC(cb, leave_interp_return);
@@ -3281,24 +3286,6 @@ gen_send_cfunc(jitstate_t *jit, ctx_t *ctx, const struct rb_callinfo *ci, const 
     return YJIT_END_BLOCK;
 }
 
-static void
-gen_return_branch(codeblock_t* cb, uint8_t* target0, uint8_t* target1, uint8_t shape)
-{
-    switch (shape)
-    {
-        case SHAPE_NEXT0:
-        case SHAPE_NEXT1:
-        RUBY_ASSERT(false);
-        break;
-
-        case SHAPE_DEFAULT:
-        mov(cb, REG0, const_ptr_opnd(target0));
-        mov(cb, member_opnd(REG_CFP, rb_control_frame_t, jit_return), REG0);
-        break;
-    }
-}
-
-// Returns whether the iseq only needs positional (lead) argument setup.
 static bool
 iseq_lead_only_arg_setup_p(const rb_iseq_t *iseq)
 {
@@ -3338,6 +3325,23 @@ rb_leaf_builtin_function(const rb_iseq_t *iseq)
     if (!rb_leaf_invokebuiltin_iseq_p(iseq))
         return NULL;
     return (const struct rb_builtin_function *)iseq->body->iseq_encoded[1];
+}
+
+static void
+gen_jump_branch(codeblock_t* cb, uint8_t* target0, uint8_t* target1, uint8_t shape)
+{
+    switch (shape) {
+        case SHAPE_NEXT0:
+        break;
+
+        case SHAPE_NEXT1:
+        RUBY_ASSERT(false);
+        break;
+
+        case SHAPE_DEFAULT:
+        jmp_ptr(cb, target0);
+        break;
+    }
 }
 
 static codegen_status_t
@@ -3517,8 +3521,10 @@ gen_send_iseq(jitstate_t *jit, ctx_t *ctx, const struct rb_callinfo *ci, const r
     // mov(cb, REG0, const_ptr_opnd(start_pc));
     // mov(cb, member_opnd(REG_CFP, rb_control_frame_t, pc), REG0);
 
-    // Stub so we can return to JITted code
-    blockid_t return_block = { jit->iseq, jit_next_insn_idx(jit) };
+    // Setup cfp->jit_return for the callee
+    uint32_t return_label = cb_new_label(cb, "send_return_point");
+    cb_load_label_address(cb, REG0, return_label);
+    mov(cb, member_opnd(REG_CFP, rb_control_frame_t, jit_return), REG0);
 
     // Create a context for the callee
     ctx_t callee_ctx = DEFAULT_CTX;
@@ -3534,6 +3540,8 @@ gen_send_iseq(jitstate_t *jit, ctx_t *ctx, const struct rb_callinfo *ci, const r
     // The callee might change locals through Kernel#binding and other means.
     ctx_clear_local_types(ctx);
 
+  <<<<<<< block-wrappers
+  =======
     // Pop arguments and receiver in return context, push the return value
     // After the return, sp_offset will be 1. The codegen for leave writes
     // the return value in case of JIT-to-JIT return.
@@ -3556,20 +3564,43 @@ gen_send_iseq(jitstate_t *jit, ctx_t *ctx, const struct rb_callinfo *ci, const r
         gen_return_branch
     );
 
+  >>>>>>> code_pages_the_sequel
     //print_str(cb, "calling Ruby func:");
     //print_str(cb, rb_id2name(vm_ci_mid(ci)));
 
     // Load the updated SP from the CFP
     mov(cb, REG_SP, member_opnd(REG_CFP, rb_control_frame_t, sp));
 
+  <<<<<<< block-wrappers
+    // Jump to the entry point of the callee
+    gen_branch(
+  =======
     // Directly jump to the entry point of the callee
     gen_direct_jump(
         cb,
+  >>>>>>> code_pages_the_sequel
         jit->block,
+        ctx,
+        (blockid_t){ iseq, start_pc_offset },
         &callee_ctx,
-        (blockid_t){ iseq, start_pc_offset }
+        BLOCKID_NULL,
+        NULL,
+        gen_jump_branch
     );
 
+    // we are even with the interpreter at the instruction boundary
+    // callee takes care of setting this up before returning.
+    ctx_stack_pop(ctx, argc + 1);
+    ctx->sp_offset = 0;
+
+    // Return point.
+    // Write the return value to the stack
+    cb_write_label(cb, return_label);
+    cb_link_labels(cb);
+    x86opnd_t top = ctx_stack_push(ctx, TYPE_UNKNOWN);
+    mov(cb, top, RAX);
+
+    jit_jump_to_next_insn(jit, ctx);
     return YJIT_END_BLOCK;
 }
 
@@ -3865,7 +3896,7 @@ gen_leave(jitstate_t* jit, ctx_t* ctx, codeblock_t* cb)
     RUBY_ASSERT(ctx->stack_size == 1);
 
     // Create a size-exit to fall back to the interpreter
-    uint8_t* side_exit = yjit_side_exit(jit, ctx);
+    uint8_t *side_exit = yjit_side_exit(jit, ctx);
 
     // Load environment pointer EP from CFP
     mov(cb, REG1, member_opnd(REG_CFP, rb_control_frame_t, ep));
@@ -3882,10 +3913,15 @@ gen_leave(jitstate_t* jit, ctx_t* ctx, codeblock_t* cb)
     add(cb, REG_CFP, imm_opnd(sizeof(rb_control_frame_t)));
     mov(cb, member_opnd(REG_EC, rb_execution_context_t, cfp), REG_CFP);
 
+  <<<<<<< block-wrappers
+    // Restore the caller's REG_SP
+    mov(cb, REG_SP, member_opnd(REG_CFP, rb_control_frame_t, sp));
+  =======
     // Reload REG_SP for the caller and write the return value.
     // Top of the stack is REG_SP[0] since the caller has sp_offset=1.
     mov(cb, REG_SP, member_opnd(REG_CFP, rb_control_frame_t, sp));
     mov(cb, mem_opnd(64, REG_SP, 0), REG0);
+  >>>>>>> code_pages_the_sequel
 
     // Jump to the JIT return address on the frame that was just popped
     const int32_t offset_to_jit_return = -((int32_t)sizeof(rb_control_frame_t)) + (int32_t)offsetof(rb_control_frame_t, jit_return);

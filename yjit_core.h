@@ -256,6 +256,9 @@ typedef struct yjit_block_version
     // block in the system.
     cme_dependency_array_t cme_dependencies;
 
+    // Wrapper object
+    VALUE self;
+
     // Index one past the last instruction in the iseq
     uint32_t end_idx;
 
