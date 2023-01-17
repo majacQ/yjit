@@ -662,7 +662,7 @@ rb_encdb_dummy(const char *name)
 static VALUE
 enc_dummy_p(VALUE enc)
 {
-    return ENC_DUMMY_P(must_encoding(enc)) ? Qtrue : Qfalse;
+    return RBOOL(ENC_DUMMY_P(must_encoding(enc)));
 }
 
 /*
@@ -678,7 +678,7 @@ enc_dummy_p(VALUE enc)
 static VALUE
 enc_ascii_compatible_p(VALUE enc)
 {
-    return rb_enc_asciicompat(must_encoding(enc)) ? Qtrue : Qfalse;
+    return RBOOL(rb_enc_asciicompat(must_encoding(enc)));
 }
 
 /*
@@ -1072,12 +1072,9 @@ rb_enc_get(VALUE obj)
     return rb_enc_from_index(rb_enc_get_index(obj));
 }
 
-static rb_encoding* enc_compatible_str(VALUE str1, VALUE str2);
-
-rb_encoding*
-rb_enc_check_str(VALUE str1, VALUE str2)
+static rb_encoding*
+rb_encoding_check(rb_encoding* enc, VALUE str1, VALUE str2)
 {
-    rb_encoding *enc = enc_compatible_str(MUST_STRING(str1), MUST_STRING(str2));
     if (!enc)
 	rb_raise(rb_eEncCompatError, "incompatible character encodings: %s and %s",
 		 rb_enc_name(rb_enc_get(str1)),
@@ -1085,15 +1082,20 @@ rb_enc_check_str(VALUE str1, VALUE str2)
     return enc;
 }
 
+static rb_encoding* enc_compatible_str(VALUE str1, VALUE str2);
+
+rb_encoding*
+rb_enc_check_str(VALUE str1, VALUE str2)
+{
+    rb_encoding *enc = enc_compatible_str(MUST_STRING(str1), MUST_STRING(str2));
+    return rb_encoding_check(enc, str1, str2);
+}
+
 rb_encoding*
 rb_enc_check(VALUE str1, VALUE str2)
 {
     rb_encoding *enc = rb_enc_compatible(str1, str2);
-    if (!enc)
-	rb_raise(rb_eEncCompatError, "incompatible character encodings: %s and %s",
-		 rb_enc_name(rb_enc_get(str1)),
-		 rb_enc_name(rb_enc_get(str2)));
-    return enc;
+    return rb_encoding_check(enc, str1, str2);
 }
 
 static rb_encoding*

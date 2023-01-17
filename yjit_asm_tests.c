@@ -58,7 +58,7 @@ void check_bytes(codeblock_t* cb, const char* bytes)
     }
 }
 
-void run_tests()
+void run_assembler_tests()
 {
     printf("Running assembler tests\n");
 
@@ -115,6 +115,43 @@ void run_tests()
 
     // cqo
     cb_set_pos(cb, 0); cqo(cb); check_bytes(cb, "4899");
+
+
+    // load label address
+    {
+        uint32_t label;
+        uint32_t pos_after_lea;
+
+        cb_set_pos(cb, 0);
+        label = cb_new_label(cb, "foo");
+        cb_load_label_address(cb, RAX, label);
+        pos_after_lea = cb->write_pos;
+        nop(cb, 42);
+        cb_write_label(cb, label);
+        cb_link_labels(cb);
+        cb_set_pos(cb, pos_after_lea);
+        check_bytes(cb, "488D052A000000");
+
+        cb_set_pos(cb, 0);
+        label = cb_new_label(cb, "foo");
+        cb_load_label_address(cb, RDI, label);
+        pos_after_lea = cb->write_pos;
+        nop(cb, 9);
+        cb_write_label(cb, label);
+        cb_link_labels(cb);
+        cb_set_pos(cb, pos_after_lea);
+        check_bytes(cb, "488D3D09000000");
+
+        cb_set_pos(cb, 0);
+        label = cb_new_label(cb, "foo");
+        cb_load_label_address(cb, R15, label);
+        pos_after_lea = cb->write_pos;
+        nop(cb, 9);
+        cb_write_label(cb, label);
+        cb_link_labels(cb);
+        cb_set_pos(cb, pos_after_lea);
+        check_bytes(cb, "4C8D3D09000000");
+    }
 
     // div
     /*
@@ -353,9 +390,64 @@ void run_tests()
     printf("Assembler tests done\n");
 }
 
+void assert_equal(expected, actual)
+{
+    if (expected != actual) {
+        fprintf(stderr, "expected %d, got %d\n", expected, actual);
+        exit(-1);
+    }
+}
+
+void run_runtime_tests()
+{
+    printf("Running runtime tests\n");
+
+    codeblock_t codeblock;
+    codeblock_t* cb = &codeblock;
+
+    uint8_t* mem_block = alloc_exec_mem(4096);
+    cb_init(cb, mem_block, 4096);
+
+    int (*function)(void);
+    function = (int (*)(void))mem_block;
+
+    #define TEST(BODY) cb_set_pos(cb, 0); BODY ret(cb); assert_equal(7, function());
+
+    // add
+    TEST({ mov(cb, RAX, imm_opnd(0)); add(cb, RAX, imm_opnd(7)); })
+    TEST({ mov(cb, RAX, imm_opnd(0)); mov(cb, RCX, imm_opnd(7)); add(cb, RAX, RCX); })
+
+    // and
+    TEST({ mov(cb, RAX, imm_opnd(31)); and(cb, RAX, imm_opnd(7)); })
+    TEST({ mov(cb, RAX, imm_opnd(31)); mov(cb, RCX, imm_opnd(7)); and(cb, RAX, RCX); })
+
+    // or
+    TEST({ mov(cb, RAX, imm_opnd(3)); or(cb, RAX, imm_opnd(4)); })
+    TEST({ mov(cb, RAX, imm_opnd(3)); mov(cb, RCX, imm_opnd(4)); or(cb, RAX, RCX); })
+
+    // push/pop
+    TEST({ mov(cb, RCX, imm_opnd(7)); push(cb, RCX); pop(cb, RAX); })
+
+    // shr
+    TEST({ mov(cb, RAX, imm_opnd(31)); shr(cb, RAX, imm_opnd(2)); })
+
+    // sub
+    TEST({ mov(cb, RAX, imm_opnd(12)); sub(cb, RAX, imm_opnd(5)); })
+    TEST({ mov(cb, RAX, imm_opnd(12)); mov(cb, RCX, imm_opnd(5)); sub(cb, RAX, RCX); })
+
+    // xor
+    TEST({ mov(cb, RAX, imm_opnd(13)); xor(cb, RAX, imm_opnd(10)); })
+    TEST({ mov(cb, RAX, imm_opnd(13)); mov(cb, RCX, imm_opnd(10)); xor(cb, RAX, RCX); })
+
+    #undef TEST
+
+    printf("Runtime tests done\n");
+}
+
 int main(int argc, char** argv)
 {
-    run_tests();
+    run_assembler_tests();
+    run_runtime_tests();
 
     return 0;
 }

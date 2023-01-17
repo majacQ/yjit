@@ -1,5 +1,5 @@
 # frozen_string_literal: true
-require 'rubygems/test_case'
+require_relative 'helper'
 require 'rubygems/commands/install_command'
 require 'rubygems/request_set'
 require 'rubygems/rdoc'
@@ -187,8 +187,8 @@ ERROR:  Could not find a valid gem 'bar' (= 0.5) (required by 'foo' (>= 0)) in a
   end
 
   def test_execute_no_user_install
-    skip 'skipped on MS Windows (chmod has no effect)' if win_platform?
-    skip 'skipped in root privilege' if Process.uid.zero?
+    pend 'skipped on MS Windows (chmod has no effect)' if win_platform?
+    pend 'skipped in root privilege' if Process.uid.zero?
 
     specs = spec_fetcher do |fetcher|
       fetcher.gem 'a', 2
@@ -1064,6 +1064,31 @@ ERROR:  Possible alternatives: non_existent_with_hint
     e = @ui.error
 
     x = "WARNING:  Unable to pull data from 'http://nonexistent.example': no data for http://nonexistent.example/specs.4.8.gz (http://nonexistent.example/specs.4.8.gz)\n"
+    assert_equal x, e
+  end
+
+  def test_redact_credentials_from_uri_on_warning
+    spec_fetcher do |fetcher|
+      fetcher.download 'a', 2
+    end
+
+    Gem.sources << "http://username:SECURE_TOKEN@nonexistent.example"
+
+    @cmd.options[:args] = %w[a]
+
+    use_ui @ui do
+      assert_raise Gem::MockGemUi::SystemExitException, @ui.error do
+        @cmd.execute
+      end
+    end
+
+    assert_equal %w[a-2], @cmd.installed_specs.map {|spec| spec.full_name }
+
+    assert_match "1 gem installed", @ui.output
+
+    e = @ui.error
+
+    x = "WARNING:  Unable to pull data from 'http://username:REDACTED@nonexistent.example': no data for http://username:REDACTED@nonexistent.example/specs.4.8.gz (http://username:REDACTED@nonexistent.example/specs.4.8.gz)\n"
     assert_equal x, e
   end
 

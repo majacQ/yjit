@@ -1,7 +1,6 @@
 #ifndef INTERNAL_STRING_H                                /*-*-C-*-vi:se ft=c:*/
 #define INTERNAL_STRING_H
 /**
- * @file
  * @author     Ruby developers <ruby-core@ruby-lang.org>
  * @copyright  This  file  is   a  part  of  the   programming  language  Ruby.
  *             Permission  is hereby  granted,  to  either redistribute  and/or
@@ -38,7 +37,7 @@ VALUE rb_external_str_with_enc(VALUE str, rb_encoding *eenc);
 VALUE rb_str_cat_conv_enc_opts(VALUE newstr, long ofs, const char *ptr, long len,
                                rb_encoding *from, int ecflags, VALUE ecopts);
 VALUE rb_enc_str_scrub(rb_encoding *enc, VALUE str, VALUE repl);
-VALUE rb_str_initialize(VALUE str, const char *ptr, long len, rb_encoding *enc);
+VALUE rb_str_escape(VALUE str);
 size_t rb_str_memsize(VALUE);
 char *rb_str_to_cstr(VALUE str);
 const char *ruby_escaped_char(int c);

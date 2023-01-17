@@ -13,7 +13,7 @@ require "bundler"
 require "rspec/core"
 require "rspec/expectations"
 require "rspec/mocks"
-require "diff/lcs"
+require "rspec/support/differ"
 
 require_relative "support/builders"
 require_relative "support/build_metadata"
@@ -73,6 +73,7 @@ RSpec.configure do |config|
     Spec::Rubygems.test_setup
     ENV["BUNDLE_SPEC_RUN"] = "true"
     ENV["BUNDLE_USER_CONFIG"] = ENV["BUNDLE_USER_CACHE"] = ENV["BUNDLE_USER_PLUGIN"] = nil
+    ENV["RUBYGEMS_GEMDEPS"] = nil
     ENV["XDG_CONFIG_HOME"] = nil
     ENV["GEMRC"] = nil
 

@@ -886,10 +886,15 @@ stat_atimespec(const struct stat *st)
 }
 
 static VALUE
+stat_time(const struct timespec ts)
+{
+    return rb_time_nano_new(ts.tv_sec, ts.tv_nsec);
+}
+
+static VALUE
 stat_atime(const struct stat *st)
 {
-    struct timespec ts = stat_atimespec(st);
-    return rb_time_nano_new(ts.tv_sec, ts.tv_nsec);
+    return stat_time(stat_atimespec(st));
 }
 
 static struct timespec
@@ -912,8 +917,7 @@ stat_mtimespec(const struct stat *st)
 static VALUE
 stat_mtime(const struct stat *st)
 {
-    struct timespec ts = stat_mtimespec(st);
-    return rb_time_nano_new(ts.tv_sec, ts.tv_nsec);
+    return stat_time(stat_mtimespec(st));
 }
 
 static struct timespec
@@ -936,8 +940,7 @@ stat_ctimespec(const struct stat *st)
 static VALUE
 stat_ctime(const struct stat *st)
 {
-    struct timespec ts = stat_ctimespec(st);
-    return rb_time_nano_new(ts.tv_sec, ts.tv_nsec);
+    return stat_time(stat_ctimespec(st));
 }
 
 #define HAVE_STAT_BIRTHTIME
@@ -1830,8 +1833,7 @@ rb_file_exists_p(VALUE obj, VALUE fname)
 static VALUE
 rb_file_readable_p(VALUE obj, VALUE fname)
 {
-    if (rb_eaccess(fname, R_OK) < 0) return Qfalse;
-    return Qtrue;
+    return RBOOL(rb_eaccess(fname, R_OK) >= 0);
 }
 
 /*
@@ -1848,8 +1850,7 @@ rb_file_readable_p(VALUE obj, VALUE fname)
 static VALUE
 rb_file_readable_real_p(VALUE obj, VALUE fname)
 {
-    if (rb_access(fname, R_OK) < 0) return Qfalse;
-    return Qtrue;
+    return RBOOL(rb_access(fname, R_OK) >= 0);
 }
 
 #ifndef S_IRUGO
@@ -1904,8 +1905,7 @@ rb_file_world_readable_p(VALUE obj, VALUE fname)
 static VALUE
 rb_file_writable_p(VALUE obj, VALUE fname)
 {
-    if (rb_eaccess(fname, W_OK) < 0) return Qfalse;
-    return Qtrue;
+    return RBOOL(rb_eaccess(fname, W_OK) >= 0);
 }
 
 /*
@@ -1922,8 +1922,7 @@ rb_file_writable_p(VALUE obj, VALUE fname)
 static VALUE
 rb_file_writable_real_p(VALUE obj, VALUE fname)
 {
-    if (rb_access(fname, W_OK) < 0) return Qfalse;
-    return Qtrue;
+    return RBOOL(rb_access(fname, W_OK) >= 0);
 }
 
 /*
@@ -1974,8 +1973,7 @@ rb_file_world_writable_p(VALUE obj, VALUE fname)
 static VALUE
 rb_file_executable_p(VALUE obj, VALUE fname)
 {
-    if (rb_eaccess(fname, X_OK) < 0) return Qfalse;
-    return Qtrue;
+    return RBOOL(rb_eaccess(fname, X_OK) >= 0);
 }
 
 /*
@@ -1996,8 +1994,7 @@ rb_file_executable_p(VALUE obj, VALUE fname)
 static VALUE
 rb_file_executable_real_p(VALUE obj, VALUE fname)
 {
-    if (rb_access(fname, X_OK) < 0) return Qfalse;
-    return Qtrue;
+    return RBOOL(rb_access(fname, X_OK) >= 0);
 }
 
 #ifndef S_ISREG
@@ -5797,11 +5794,11 @@ rb_stat_r(VALUE obj)
 #endif
 #ifdef S_IRUSR
     if (rb_stat_owned(obj))
-	return st->st_mode & S_IRUSR ? Qtrue : Qfalse;
+	return RBOOL(st->st_mode & S_IRUSR);
 #endif
 #ifdef S_IRGRP
     if (rb_stat_grpowned(obj))
-	return st->st_mode & S_IRGRP ? Qtrue : Qfalse;
+	return RBOOL(st->st_mode & S_IRGRP);
 #endif
 #ifdef S_IROTH
     if (!(st->st_mode & S_IROTH)) return Qfalse;
@@ -5830,11 +5827,11 @@ rb_stat_R(VALUE obj)
 #endif
 #ifdef S_IRUSR
     if (rb_stat_rowned(obj))
-	return st->st_mode & S_IRUSR ? Qtrue : Qfalse;
+	return RBOOL(st->st_mode & S_IRUSR);
 #endif
 #ifdef S_IRGRP
     if (rb_group_member(get_stat(obj)->st_gid))
-	return st->st_mode & S_IRGRP ? Qtrue : Qfalse;
+	return RBOOL(st->st_mode & S_IRGRP);
 #endif
 #ifdef S_IROTH
     if (!(st->st_mode & S_IROTH)) return Qfalse;
@@ -5890,11 +5887,11 @@ rb_stat_w(VALUE obj)
 #endif
 #ifdef S_IWUSR
     if (rb_stat_owned(obj))
-	return st->st_mode & S_IWUSR ? Qtrue : Qfalse;
+	return RBOOL(st->st_mode & S_IWUSR);
 #endif
 #ifdef S_IWGRP
     if (rb_stat_grpowned(obj))
-	return st->st_mode & S_IWGRP ? Qtrue : Qfalse;
+	return RBOOL(st->st_mode & S_IWGRP);
 #endif
 #ifdef S_IWOTH
     if (!(st->st_mode & S_IWOTH)) return Qfalse;
@@ -5923,11 +5920,11 @@ rb_stat_W(VALUE obj)
 #endif
 #ifdef S_IWUSR
     if (rb_stat_rowned(obj))
-	return st->st_mode & S_IWUSR ? Qtrue : Qfalse;
+	return RBOOL(st->st_mode & S_IWUSR);
 #endif
 #ifdef S_IWGRP
     if (rb_group_member(get_stat(obj)->st_gid))
-	return st->st_mode & S_IWGRP ? Qtrue : Qfalse;
+	return RBOOL(st->st_mode & S_IWGRP);
 #endif
 #ifdef S_IWOTH
     if (!(st->st_mode & S_IWOTH)) return Qfalse;
@@ -5982,16 +5979,16 @@ rb_stat_x(VALUE obj)
 
 #ifdef USE_GETEUID
     if (geteuid() == 0) {
-	return st->st_mode & S_IXUGO ? Qtrue : Qfalse;
+	return RBOOL(st->st_mode & S_IXUGO);
     }
 #endif
 #ifdef S_IXUSR
     if (rb_stat_owned(obj))
-	return st->st_mode & S_IXUSR ? Qtrue : Qfalse;
+	return RBOOL(st->st_mode & S_IXUSR);
 #endif
 #ifdef S_IXGRP
     if (rb_stat_grpowned(obj))
-	return st->st_mode & S_IXGRP ? Qtrue : Qfalse;
+	return RBOOL(st->st_mode & S_IXGRP);
 #endif
 #ifdef S_IXOTH
     if (!(st->st_mode & S_IXOTH)) return Qfalse;
@@ -6014,16 +6011,16 @@ rb_stat_X(VALUE obj)
 
 #ifdef USE_GETEUID
     if (getuid() == 0) {
-	return st->st_mode & S_IXUGO ? Qtrue : Qfalse;
+	return RBOOL(st->st_mode & S_IXUGO);
     }
 #endif
 #ifdef S_IXUSR
     if (rb_stat_rowned(obj))
-	return st->st_mode & S_IXUSR ? Qtrue : Qfalse;
+	return RBOOL(st->st_mode & S_IXUSR);
 #endif
 #ifdef S_IXGRP
     if (rb_group_member(get_stat(obj)->st_gid))
-	return st->st_mode & S_IXGRP ? Qtrue : Qfalse;
+	return RBOOL(st->st_mode & S_IXGRP);
 #endif
 #ifdef S_IXOTH
     if (!(st->st_mode & S_IXOTH)) return Qfalse;
@@ -6069,11 +6066,13 @@ rb_stat_z(VALUE obj)
 
 /*
  *  call-seq:
- *     state.size    -> integer
+ *     stat.size?    -> Integer or nil
  *
- *  Returns the size of <i>stat</i> in bytes.
+ *  Returns +nil+ if <i>stat</i> is a zero-length file, the size of
+ *  the file otherwise.
  *
- *     File.stat("testfile").size   #=> 66
+ *     File.stat("testfile").size?   #=> 66
+ *     File.stat("/dev/null").size?  #=> nil
  *
  */
 
@@ -6542,11 +6541,12 @@ const char ruby_null_device[] =
  *
  *  First, what's elsewhere. \Class \File:
  *
- *  - Inherits from class IO -- in particular, methods for creating,
- *    reading, and writing files.
- *  - Includes module FileTest.
+ *  - Inherits from {class IO}[IO.html#class-IO-label-What-27s+Here],
+ *    in particular, methods for creating, reading, and writing files
+ *  - Includes {module FileTest}[FileTest.html#module-FileTest-label-What-27s+Here].
+ *    which provides dozens of additional methods.
  *
- *  Here, Class \File provides methods that are useful for:
+ *  Here, class \File provides methods that are useful for:
  *
  *  - {Creating}[#class-File-label-Creating]
  *  - {Querying}[#class-File-label-Querying]

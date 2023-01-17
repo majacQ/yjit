@@ -13,7 +13,6 @@
 #include "yjit_iface.h"
 #include "yjit_codegen.h"
 #include "yjit_core.h"
-#include "yjit_hooks.inc"
 #include "darray.h"
 
 #ifdef HAVE_LIBCAPSTONE
@@ -25,44 +24,121 @@ static VALUE cYjitDisasmInsn;
 static VALUE mYjit;
 static VALUE cYjitBlock;
 
-#if RUBY_DEBUG
-static int64_t vm_insns_count = 0;
-static int64_t exit_op_count[VM_INSTRUCTION_SIZE] = { 0 };
-int64_t rb_compiled_iseq_count = 0;
-struct rb_yjit_runtime_counters yjit_runtime_counters = { 0 };
+#if YJIT_STATS
 static VALUE cYjitCodeComment;
+#endif
+
+#if YJIT_STATS
+extern const int rb_vm_max_insn_name_size;
+static int64_t exit_op_count[VM_INSTRUCTION_SIZE] = { 0 };
+struct rb_yjit_runtime_counters yjit_runtime_counters = { 0 };
 #endif
 
 // Machine code blocks (executable memory)
 extern codeblock_t *cb;
 extern codeblock_t *ocb;
 
+// Current code page we are writing machine code into
+VALUE yjit_cur_code_page = Qfalse;
+
 // Hash table of encoded instructions
 extern st_table *rb_encoded_insn_data;
 
 struct rb_yjit_options rb_yjit_opts;
 
+static void
+yjit_block_mark(void * ptr)
+{
+    block_t * block = (block_t *)ptr;
+
+    // When the block is invalidated, it sets the `self` pointer to nil.
+    // Don't mark any edges if the block has been invalidated.
+    if (RTEST(block->self)) {
+        rb_gc_mark_movable(block->code_page);
+        rb_gc_mark_movable((VALUE)block->blockid.iseq);
+        rb_gc_mark_movable(block->receiver_klass);
+        rb_gc_mark_movable(block->callee_cme);
+
+        rb_darray_for(block->outgoing, branch_idx) {
+            branch_t* branch = rb_darray_get(block->outgoing, branch_idx);
+
+            for (size_t i = 0; i < 2; i++) {
+                block_t* succ = branch->blocks[i];
+
+                // Mark outgoing successors (if we have them)
+                if (succ) {
+                    rb_gc_mark_movable(succ->self);
+                }
+
+                // Mark ISEQs associated with any targets
+                rb_gc_mark_movable((VALUE)branch->targets[i].iseq);
+            }
+
+            // Walk over references to objects in generated code.
+            uint32_t *offset_element;
+            rb_darray_foreach(block->gc_object_offsets, offset_idx, offset_element) {
+                uint32_t offset_to_value = *offset_element;
+                uint8_t *value_address = cb_get_ptr(cb, offset_to_value);
+
+                VALUE object;
+                memcpy(&object, value_address, SIZEOF_VALUE);
+                rb_gc_mark_movable(object);
+            }
+        }
+    }
+}
+
+static void
+yjit_block_free(void * ptr)
+{
+    free(ptr);
+}
+
+static void
+yjit_block_update_references(void * ptr)
+{
+    block_t * block = (block_t *)ptr;
+
+    // If self has been cleared, the block has been invalidated, so don't
+    // bother to update references.
+    if (RTEST(block->self)) {
+        // Update the machine code page this block lives on
+        block->code_page = rb_gc_location(block->code_page);
+        block->self = rb_gc_location(block->self);
+        block->blockid.iseq = (const rb_iseq_t *)rb_gc_location((VALUE)block->blockid.iseq);
+        block->receiver_klass = rb_gc_location(block->receiver_klass);
+        block->callee_cme = rb_gc_location(block->callee_cme);
+
+        // Update outgoing branch entries
+        rb_darray_for(block->outgoing, branch_idx) {
+            branch_t* branch = rb_darray_get(block->outgoing, branch_idx);
+            for (int i = 0; i < 2; ++i) {
+                branch->targets[i].iseq = (const void *)rb_gc_location((VALUE)branch->targets[i].iseq);
+            }
+        }
+
+        // Walk over references to objects in generated code.
+        uint32_t *offset_element;
+        rb_darray_foreach(block->gc_object_offsets, offset_idx, offset_element) {
+            uint32_t offset_to_value = *offset_element;
+            uint8_t *value_address = cb_get_ptr(cb, offset_to_value);
+
+            VALUE object;
+            memcpy(&object, value_address, SIZEOF_VALUE);
+            VALUE possibly_moved = rb_gc_location(object);
+            // Only write when the VALUE moves, to be CoW friendly.
+            if (possibly_moved != object) {
+                memcpy(value_address, &possibly_moved, SIZEOF_VALUE);
+            }
+        }
+    }
+}
+
 static const rb_data_type_t yjit_block_type = {
     "YJIT/Block",
-    {0, 0, 0, },
+    {yjit_block_mark, yjit_block_free, 0, yjit_block_update_references},
     0, 0, RUBY_TYPED_FREE_IMMEDIATELY
 };
-
-// Write the YJIT entry point pre-call bytes
-void
-cb_write_pre_call_bytes(codeblock_t* cb)
-{
-    for (size_t i = 0; i < sizeof(yjit_with_ec_pre_call_bytes); ++i)
-        cb_write_byte(cb, yjit_with_ec_pre_call_bytes[i]);
-}
-
-// Write the YJIT exit post-call bytes
-void
-cb_write_post_call_bytes(codeblock_t* cb)
-{
-    for (size_t i = 0; i < sizeof(yjit_with_ec_post_call_bytes); ++i)
-        cb_write_byte(cb, yjit_with_ec_post_call_bytes[i]);
-}
 
 // Get the PC for a given index in an iseq
 VALUE *
@@ -89,6 +165,17 @@ map_addr2insn(void *code_ptr, int insn)
     else {
         rb_bug("yjit: failed to find info for original instruction while dealing with addr2insn");
     }
+}
+
+// For debugging. Print the disassembly of an iseq.
+void
+yjit_print_iseq(const rb_iseq_t *iseq)
+{
+    char *ptr;
+    long len;
+    VALUE disassembly = rb_iseq_disasm(iseq);
+    RSTRING_GETMEM(disassembly, ptr, len);
+    fprintf(stderr, "%.*s\n", (int)len, ptr);
 }
 
 int
@@ -125,19 +212,6 @@ check_cfunc_dispatch(VALUE receiver, struct rb_callinfo *ci, void *callee, rb_ca
 }
 
 MJIT_FUNC_EXPORTED VALUE rb_hash_has_key(VALUE hash, VALUE key);
-
-bool
-cfunc_needs_frame(const rb_method_cfunc_t *cfunc)
-{
-    void* fptr = (void*)cfunc->func;
-
-    // Leaf C functions do not need a stack frame
-    // or a stack overflow check
-    return !(
-        // Hash#key?
-        fptr == (void*)rb_hash_has_key
-    );
-}
 
 // GC root for interacting with the GC
 struct yjit_root_struct {
@@ -231,8 +305,9 @@ add_lookup_dependency_i(st_data_t *key, st_data_t *value, st_data_t data, int ex
     return ST_CONTINUE;
 }
 
-// Remember that a block assumes that rb_callable_method_entry(receiver_klass, mid) == cme and that
-// cme is vald.
+// Remember that a block assumes that
+// `rb_callable_method_entry(receiver_klass, cme->called_id) == cme` and that
+// `cme` is valid.
 // When either of these assumptions becomes invalid, rb_yjit_method_lookup_change() or
 // rb_yjit_cme_invalidate() invalidates the block.
 //
@@ -240,16 +315,17 @@ add_lookup_dependency_i(st_data_t *key, st_data_t *value, st_data_t data, int ex
 void
 assume_method_lookup_stable(VALUE receiver_klass, const rb_callable_method_entry_t *cme, block_t *block)
 {
-    RUBY_ASSERT(!block->receiver_klass && !block->callee_cme);
     RUBY_ASSERT(cme_validity_dependency);
     RUBY_ASSERT(method_lookup_dependency);
-    RUBY_ASSERT_ALWAYS(RB_TYPE_P(receiver_klass, T_CLASS));
+    RUBY_ASSERT(rb_callable_method_entry(receiver_klass, cme->called_id) == cme);
+    RUBY_ASSERT_ALWAYS(RB_TYPE_P(receiver_klass, T_CLASS) || RB_TYPE_P(receiver_klass, T_ICLASS));
     RUBY_ASSERT_ALWAYS(!rb_objspace_garbage_object_p(receiver_klass));
 
-    block->callee_cme = (VALUE)cme;
+    cme_dependency_t cme_dep = { receiver_klass, (VALUE)cme };
+    rb_darray_append(&block->cme_dependencies, cme_dep);
+
     st_update(cme_validity_dependency, (st_data_t)cme, add_cme_validity_dependency_i, (st_data_t)block);
 
-    block->receiver_klass = receiver_klass;
     struct lookup_dependency_insertion info = { block, cme->called_id };
     st_update(method_lookup_dependency, (st_data_t)receiver_klass, add_lookup_dependency_i, (st_data_t)&info);
 }
@@ -304,6 +380,8 @@ yjit_root_mark(void *ptr)
         // references.
         st_foreach(cme_validity_dependency, mark_and_pin_keys_i, 0);
     }
+
+    rb_gc_mark(yjit_cur_code_page);
 }
 
 static void
@@ -407,17 +485,16 @@ rb_yjit_invalidate_all_method_lookup_assumptions(void)
 
 // Remove a block from the method lookup dependency table
 static void
-remove_method_lookup_dependency(block_t *block)
+remove_method_lookup_dependency(block_t *block, VALUE receiver_klass, const rb_callable_method_entry_t *callee_cme)
 {
-    if (!block->receiver_klass) return;
-    RUBY_ASSERT(block->callee_cme); // callee_cme should be set when receiver_klass is set
+    RUBY_ASSERT(receiver_klass);
+    RUBY_ASSERT(callee_cme); // callee_cme should be set when receiver_klass is set
 
     st_data_t image;
-    st_data_t key = (st_data_t)block->receiver_klass;
+    st_data_t key = (st_data_t)receiver_klass;
     if (st_lookup(method_lookup_dependency, key, &image)) {
         struct rb_id_table *id2blocks = (void *)image;
-        const rb_callable_method_entry_t *cme = (void *)block->callee_cme;
-        ID mid = cme->called_id;
+        ID mid = callee_cme->called_id;
 
         // Find block set
         VALUE blocks;
@@ -439,12 +516,12 @@ remove_method_lookup_dependency(block_t *block)
 
 // Remove a block from cme_validity_dependency
 static void
-remove_cme_validity_dependency(block_t *block)
+remove_cme_validity_dependency(block_t *block, const rb_callable_method_entry_t *callee_cme)
 {
-    if (!block->callee_cme) return;
+    RUBY_ASSERT(callee_cme);
 
     st_data_t blocks;
-    if (st_lookup(cme_validity_dependency, block->callee_cme, &blocks)) {
+    if (st_lookup(cme_validity_dependency, (st_data_t)callee_cme, &blocks)) {
         st_table *block_set = (st_table *)blocks;
 
         st_data_t block_as_st_data = (st_data_t)block;
@@ -455,8 +532,12 @@ remove_cme_validity_dependency(block_t *block)
 void
 yjit_unlink_method_lookup_dependency(block_t *block)
 {
-    remove_method_lookup_dependency(block);
-    remove_cme_validity_dependency(block);
+    cme_dependency_t *cme_dep;
+    rb_darray_foreach(block->cme_dependencies, cme_dependency_idx, cme_dep) {
+        remove_method_lookup_dependency(block, cme_dep->receiver_klass, (const rb_callable_method_entry_t *)cme_dep->callee_cme);
+        remove_cme_validity_dependency(block, (const rb_callable_method_entry_t *)cme_dep->callee_cme);
+    }
+    rb_darray_free(block->cme_dependencies);
 }
 
 void
@@ -476,33 +557,68 @@ yjit_block_assumptions_free(block_t *block)
     }
 }
 
-void
+typedef VALUE (*yjit_func_t)(rb_execution_context_t *, rb_control_frame_t *);
+
+bool
 rb_yjit_compile_iseq(const rb_iseq_t *iseq, rb_execution_context_t *ec)
 {
-#if OPT_DIRECT_THREADED_CODE || OPT_CALL_THREADED_CODE
+#if (OPT_DIRECT_THREADED_CODE || OPT_CALL_THREADED_CODE) && JIT_ENABLED
+    bool success = true;
     RB_VM_LOCK_ENTER();
     // TODO: I think we need to stop all other ractors here
-    VALUE *encoded = (VALUE *)iseq->body->iseq_encoded;
 
     // Compile a block version starting at the first instruction
     uint8_t* code_ptr = gen_entry_point(iseq, 0, ec);
 
     if (code_ptr)
     {
-        // Map the code address to the corresponding opcode
-        int first_opcode = yjit_opcode_at_pc(iseq, &encoded[0]);
-        map_addr2insn(code_ptr, first_opcode);
-        encoded[0] = (VALUE)code_ptr;
+        iseq->body->jit_func = (yjit_func_t)code_ptr;
+    }
+    else {
+        iseq->body->jit_func = 0;
+        success = false;
     }
 
     RB_VM_LOCK_LEAVE();
+    return success;
+#else
+    return false;
 #endif
 }
 
-struct yjit_block_itr {
-    const rb_iseq_t *iseq;
-    VALUE list;
-};
+/* Wrap a `block_t` object with a Ruby object and return the Ruby object */
+VALUE
+yjit_wrap_block(block_t * block)
+{
+    return TypedData_Wrap_Struct(cYjitBlock, &yjit_block_type, block);
+}
+
+/* Get a list of the YJIT blocks associated with `rb_iseq` */
+static VALUE
+yjit_entry_blocks_for(VALUE mod, VALUE rb_iseq)
+{
+    if (CLASS_OF(rb_iseq) != rb_cISeq) {
+        return rb_ary_new();
+    }
+
+    const rb_iseq_t *iseq = rb_iseqw_to_iseq(rb_iseq);
+
+    VALUE roots = rb_ary_new();
+
+    if (rb_darray_size(iseq->body->yjit_blocks) > 0) {
+        rb_yjit_block_array_t versions = rb_darray_get(iseq->body->yjit_blocks, 0);
+
+        rb_darray_for(versions, block_idx) {
+            block_t *block = rb_darray_get(versions, block_idx);
+
+            if (block->blockid.idx == 0) {
+                rb_ary_push(roots, block->self);
+            }
+        }
+    }
+
+    return roots;
+}
 
 /* Get a list of the YJIT blocks associated with `rb_iseq` */
 static VALUE
@@ -536,7 +652,7 @@ block_address(VALUE self)
 {
     block_t * block;
     TypedData_Get_Struct(self, block_t, &yjit_block_type, block);
-    uint8_t* code_addr = cb_get_ptr(cb, block->start_pos);
+    uint8_t* code_addr = block->start_pos;
     return LONG2NUM((intptr_t)code_addr);
 }
 
@@ -548,7 +664,7 @@ block_code(VALUE self)
     TypedData_Get_Struct(self, block_t, &yjit_block_type, block);
 
     return (VALUE)rb_str_new(
-        (const char*)cb->mem_block + block->start_pos,
+        (const char*)block->start_pos,
         block->end_pos - block->start_pos
     );
 }
@@ -597,13 +713,24 @@ rb_yjit_constant_state_changed(void)
 {
     if (blocks_assuming_stable_global_constant_state) {
         st_foreach(blocks_assuming_stable_global_constant_state, block_invalidation_iterator, 0);
+#if YJIT_STATS
+        yjit_runtime_counters.constant_state_bumps++;
+#endif
     }
 }
 
-// Callback from the opt_setinlinecache instruction in the interpreter
+// Callback from the opt_setinlinecache instruction in the interpreter.
+// Invalidate the block for the matching opt_getinlinecache so it could regenerate code
+// using the new value in the constant cache.
 void
 yjit_constant_ic_update(const rb_iseq_t *iseq, IC ic)
 {
+    // We can't generate code in these situations, so no need to invalidate.
+    // See gen_opt_getinlinecache.
+    if (ic->entry->ic_cref || rb_multi_ractor_p()) {
+        return;
+    }
+
     RB_VM_LOCK_ENTER();
     rb_vm_barrier(); // Stop other ractors since we are going to patch machine code.
     {
@@ -720,18 +847,39 @@ comments_for(rb_execution_context_t *ec, VALUE self, VALUE start_address, VALUE 
     return comment_array;
 }
 
-// Primitive called in yjit.rb. Export all runtime counters as a Ruby hash.
+// Primitive called in yjit.rb. Export all YJIT statistics as a Ruby hash.
 static VALUE
-get_stat_counters(rb_execution_context_t *ec, VALUE self)
+get_yjit_stats(rb_execution_context_t *ec, VALUE self)
 {
-#if RUBY_DEBUG
-    if (!rb_yjit_opts.gen_stats) return Qnil;
+    // Return Qnil if YJIT isn't enabled
+    if (cb == NULL) {
+        return Qnil;
+    }
 
     VALUE hash = rb_hash_new();
+
     RB_VM_LOCK_ENTER();
+
     {
+        VALUE key = ID2SYM(rb_intern("inline_code_size"));
+        VALUE value = LL2NUM((long long)cb->write_pos);
+        rb_hash_aset(hash, key, value);
+
+        key = ID2SYM(rb_intern("outlined_code_size"));
+        value = LL2NUM((long long)ocb->write_pos);
+        rb_hash_aset(hash, key, value);
+    }
+
+#if YJIT_STATS
+    if (rb_yjit_opts.gen_stats) {
+        // Indicate that the complete set of stats is available
+        rb_hash_aset(hash, ID2SYM(rb_intern("all_stats")), Qtrue);
+
         int64_t *counter_reader = (int64_t *)&yjit_runtime_counters;
         int64_t *counter_reader_end = &yjit_runtime_counters.last_member;
+
+        // For each counter in yjit_counter_names, add that counter as
+        // a key/value pair.
 
         // Iterate through comma separated counter name list
         char *name_reader = yjit_counter_names;
@@ -742,7 +890,7 @@ get_stat_counters(rb_execution_context_t *ec, VALUE self)
                 continue;
             }
 
-            // Compute name of counter name
+            // Compute length of counter name
             int name_len;
             char *name_end;
             {
@@ -759,36 +907,45 @@ get_stat_counters(rb_execution_context_t *ec, VALUE self)
             counter_reader++;
             name_reader = name_end;
         }
+
+        // For each entry in exit_op_count, add a stats entry with key "exit_INSTRUCTION_NAME"
+        // and the value is the count of side exits for that instruction.
+
+        char key_string[rb_vm_max_insn_name_size + 6]; // Leave room for "exit_" and a final NUL
+        for (int i = 0; i < VM_INSTRUCTION_SIZE; i++) {
+            const char *i_name = insn_name(i); // Look up Ruby's NUL-terminated insn name string
+            snprintf(key_string, rb_vm_max_insn_name_size + 6, "%s%s", "exit_", i_name);
+
+            VALUE key = ID2SYM(rb_intern(key_string));
+            VALUE value = LL2NUM((long long)exit_op_count[i]);
+            rb_hash_aset(hash, key, value);
+        }
     }
+#endif
+
     RB_VM_LOCK_LEAVE();
+
     return hash;
-#else
-    return Qnil;
-#endif // if RUBY_DEBUG
 }
 
 // Primitive called in yjit.rb. Zero out all the counters.
 static VALUE
 reset_stats_bang(rb_execution_context_t *ec, VALUE self)
 {
-#if RUBY_DEBUG
-    vm_insns_count = 0;
-    rb_compiled_iseq_count = 0;
+#if YJIT_STATS
     memset(&exit_op_count, 0, sizeof(exit_op_count));
     memset(&yjit_runtime_counters, 0, sizeof(yjit_runtime_counters));
-#endif // if RUBY_DEBUG
+#endif // if YJIT_STATS
     return Qnil;
 }
 
 #include "yjit.rbinc"
 
-#if RUBY_DEBUG
-// implementation for --yjit-stats
-
+#if YJIT_STATS
 void
 rb_yjit_collect_vm_usage_insn(int insn)
 {
-    vm_insns_count++;
+    yjit_runtime_counters.vm_insns_count++;
 }
 
 void
@@ -810,130 +967,11 @@ rb_yjit_count_side_exit_op(const VALUE *exit_pc)
     exit_op_count[insn]++;
     return exit_pc; // This function must return exit_pc!
 }
+#endif
 
-struct insn_count {
-    int64_t insn;
-    int64_t count;
-};
-
-static int
-insn_count_sort_comp(const void *a, const void *b)
-{
-    const struct insn_count *count_a = a;
-    const struct insn_count *count_b = b;
-    if (count_a->count > count_b->count) {
-        return -1;
-    }
-    else if (count_a->count < count_b->count) {
-        return 1;
-    }
-    return 0;
-}
-
-static struct insn_count insn_sorting_buffer[VM_INSTRUCTION_SIZE];
-static const struct insn_count *
-sort_insn_count_array(int64_t *array)
-{
-    for (int i = 0; i < VM_INSTRUCTION_SIZE; i++) {
-        insn_sorting_buffer[i] = (struct insn_count) { i, array[i] };
-    }
-    qsort(insn_sorting_buffer, VM_INSTRUCTION_SIZE, sizeof(insn_sorting_buffer[0]), &insn_count_sort_comp);
-    return insn_sorting_buffer;
-}
-
-// Compute the total interpreter exit count
-static int64_t
-calc_total_exit_count()
-{
-    size_t total_exit_count = 0;
-    for (int i = 0; i < VM_INSTRUCTION_SIZE; i++) {
-        total_exit_count += exit_op_count[i];
-    }
-
-    return total_exit_count;
-}
-
+// This function marks *all* blocks associated with the iseq.  We need to
+// delete this after we can mark blocks that are on the stack.
 static void
-print_insn_count_buffer(int how_many, int left_pad)
-{
-    size_t total_exit_count = calc_total_exit_count();
-
-    // Sort the exit ops by decreasing frequency
-    const struct insn_count *sorted_exit_ops = sort_insn_count_array(exit_op_count);
-
-    // Compute the longest instruction name and top10_exit_count
-    size_t longest_insn_len = 0;
-    size_t top10_exit_count = 0;
-    for (int i = 0; i < how_many; i++) {
-        const char *instruction_name = insn_name(sorted_exit_ops[i].insn);
-        size_t len = strlen(instruction_name);
-        if (len > longest_insn_len) {
-            longest_insn_len = len;
-        }
-        top10_exit_count += sorted_exit_ops[i].count;
-    }
-
-    double top10_exit_percent = 100.0 * top10_exit_count / total_exit_count;
-
-    fprintf(stderr, "top-%d most frequent exit ops (%.1f%% of exits):\n", how_many, top10_exit_percent);
-
-    // Print the top-N most frequent exit counts
-    for (int i = 0; i < how_many; i++) {
-        const char *instruction_name = insn_name(sorted_exit_ops[i].insn);
-        size_t padding = left_pad + longest_insn_len - strlen(instruction_name);
-        for (size_t j = 0; j < padding; j++) {
-            fputc(' ', stderr);
-        }
-        double percent = 100 * sorted_exit_ops[i].count / (double)total_exit_count;
-        fprintf(stderr, "%s: %10" PRId64 " (%.1f%%)\n", instruction_name, sorted_exit_ops[i].count, percent);
-    }
-}
-
-__attribute__((destructor))
-static void
-print_yjit_stats(void)
-{
-    if (!rb_yjit_opts.gen_stats) {
-        return;
-    }
-
-    // Warn if the executable code block is out of the relative
-    // 32-bit jump range away from compiled C code
-    ptrdiff_t start_diff = (cb->mem_block + cb->mem_size) - (uint8_t*)&print_yjit_stats;
-    if (start_diff < INT32_MIN || start_diff > INT32_MAX) {
-        fprintf(stderr, "WARNING: end of code block past rel32 offset range from C code\n");
-    }
-
-    // Compute the total exit count
-    int64_t total_exit_count = calc_total_exit_count();
-
-    // Number of instructions that finish executing in YJIT. See :count-placement:.
-    int64_t retired_in_yjit = yjit_runtime_counters.exec_instruction - total_exit_count;
-
-    // Average length of instruction sequences executed by YJIT
-    double avg_len_in_yjit = (double)retired_in_yjit / total_exit_count;
-
-    // Proportion of instructions that retire in YJIT
-    int64_t total_insns_count = retired_in_yjit + vm_insns_count;
-    double ratio = retired_in_yjit / (double)total_insns_count;
-
-    fprintf(stderr, "compiled_iseq_count:   %10" PRId64 "\n", rb_compiled_iseq_count);
-    fprintf(stderr, "inline_code_size:      %10d\n", cb->write_pos);
-    fprintf(stderr, "outlined_code_size:    %10d\n", ocb->write_pos);
-
-    fprintf(stderr, "total_exit_count:      %10" PRId64 "\n", total_exit_count);
-    fprintf(stderr, "total_insns_count:     %10" PRId64 "\n", total_insns_count);
-    fprintf(stderr, "vm_insns_count:        %10" PRId64 "\n", vm_insns_count);
-    fprintf(stderr, "yjit_insns_count:      %10" PRId64 "\n", yjit_runtime_counters.exec_instruction);
-    fprintf(stderr, "ratio_in_yjit:         %9.1f%%\n", ratio * 100);
-    fprintf(stderr, "avg_len_in_yjit:       %10.1f\n", avg_len_in_yjit);
-
-    // Print the top-N most frequent exit ops
-    print_insn_count_buffer(20, 4);
-}
-#endif // if RUBY_DEBUG
-
-void
 rb_yjit_iseq_mark(const struct rb_iseq_constant_body *body)
 {
     rb_darray_for(body->yjit_blocks, version_array_idx) {
@@ -942,9 +980,17 @@ rb_yjit_iseq_mark(const struct rb_iseq_constant_body *body)
         rb_darray_for(version_array, block_idx) {
             block_t *block = rb_darray_get(version_array, block_idx);
 
+  <<<<<<< block-wrappers
+            // Mark all associated blocks
+            rb_gc_mark_movable((VALUE)block->self);
+  =======
             rb_gc_mark_movable((VALUE)block->blockid.iseq);
-            rb_gc_mark_movable(block->receiver_klass);
-            rb_gc_mark_movable(block->callee_cme);
+
+            cme_dependency_t *cme_dep;
+            rb_darray_foreach(block->cme_dependencies, cme_dependency_idx, cme_dep) {
+                rb_gc_mark_movable(cme_dep->receiver_klass);
+                rb_gc_mark_movable(cme_dep->callee_cme);
+            }
 
             // Mark outgoing branch entries
             rb_darray_for(block->outgoing, branch_idx) {
@@ -955,22 +1001,36 @@ rb_yjit_iseq_mark(const struct rb_iseq_constant_body *body)
             }
 
             // Walk over references to objects in generated code.
-            uint32_t *offset_element;
+            uint8_t **offset_element;
             rb_darray_foreach(block->gc_object_offsets, offset_idx, offset_element) {
-                uint32_t offset_to_value = *offset_element;
-                uint8_t *value_address = cb_get_ptr(cb, offset_to_value);
+                uint8_t *value_address = *offset_element;
 
                 VALUE object;
                 memcpy(&object, value_address, SIZEOF_VALUE);
                 rb_gc_mark_movable(object);
             }
+  >>>>>>> code_pages_the_sequel
         }
     }
 }
 
+/* Mark all entry blocks associated with this iseq */
 void
-rb_yjit_iseq_update_references(const struct rb_iseq_constant_body *body)
+rb_yjit_mark_iseq_entry_blocks(const rb_iseq_t *iseq)
 {
+  <<<<<<< block-wrappers
+    rb_yjit_iseq_mark(iseq->body);
+
+    if (rb_darray_size(iseq->body->yjit_blocks) > 0) {
+        rb_yjit_block_array_t versions = rb_darray_get(iseq->body->yjit_blocks, 0);
+
+        rb_darray_for(versions, block_idx) {
+            block_t *block = rb_darray_get(versions, block_idx);
+            RUBY_ASSERT(block->blockid.idx == 0);
+
+            // Mark the block wrapper
+            rb_gc_mark_movable(block->self);
+  =======
     rb_darray_for(body->yjit_blocks, version_array_idx) {
         rb_yjit_block_array_t version_array = rb_darray_get(body->yjit_blocks, version_array_idx);
 
@@ -979,8 +1039,11 @@ rb_yjit_iseq_update_references(const struct rb_iseq_constant_body *body)
 
             block->blockid.iseq = (const rb_iseq_t *)rb_gc_location((VALUE)block->blockid.iseq);
 
-            block->receiver_klass = rb_gc_location(block->receiver_klass);
-            block->callee_cme = rb_gc_location(block->callee_cme);
+            cme_dependency_t *cme_dep;
+            rb_darray_foreach(block->cme_dependencies, cme_dependency_idx, cme_dep) {
+                cme_dep->receiver_klass = rb_gc_location(cme_dep->receiver_klass);
+                cme_dep->callee_cme = rb_gc_location(cme_dep->callee_cme);
+            }
 
             // Update outgoing branch entries
             rb_darray_for(block->outgoing, branch_idx) {
@@ -991,10 +1054,9 @@ rb_yjit_iseq_update_references(const struct rb_iseq_constant_body *body)
             }
 
             // Walk over references to objects in generated code.
-            uint32_t *offset_element;
+            uint8_t **offset_element;
             rb_darray_foreach(block->gc_object_offsets, offset_idx, offset_element) {
-                uint32_t offset_to_value = *offset_element;
-                uint8_t *value_address = cb_get_ptr(cb, offset_to_value);
+                uint8_t *value_address = *offset_element;
 
                 VALUE object;
                 memcpy(&object, value_address, SIZEOF_VALUE);
@@ -1004,6 +1066,7 @@ rb_yjit_iseq_update_references(const struct rb_iseq_constant_body *body)
                     memcpy(value_address, &possibly_moved, SIZEOF_VALUE);
                 }
             }
+  >>>>>>> code_pages_the_sequel
         }
     }
 }
@@ -1015,15 +1078,83 @@ rb_yjit_iseq_free(const struct rb_iseq_constant_body *body)
     rb_darray_for(body->yjit_blocks, version_array_idx) {
         rb_yjit_block_array_t version_array = rb_darray_get(body->yjit_blocks, version_array_idx);
 
-        rb_darray_for(version_array, block_idx) {
-            block_t *block = rb_darray_get(version_array, block_idx);
-            yjit_free_block(block);
-        }
-
         rb_darray_free(version_array);
     }
 
     rb_darray_free(body->yjit_blocks);
+}
+
+static void
+yjit_code_page_free(void *code_page)
+{
+    fprintf(stderr, "FREEING CODE PAGE\n");
+
+    free_code_page((code_page_t*)code_page);
+}
+
+// Custom type for interacting with the GC
+static const rb_data_type_t yjit_code_page_type = {
+    "yjit_code_page",
+    {NULL, yjit_code_page_free, NULL, NULL},
+    0, 0, RUBY_TYPED_FREE_IMMEDIATELY
+};
+
+// Allocate a code page and wrap it into a Ruby object owned by the GC
+VALUE rb_yjit_code_page_alloc(void)
+{
+    code_page_t* code_page = alloc_code_page();
+    VALUE cp_obj = TypedData_Wrap_Struct(0, &yjit_code_page_type, code_page);
+
+    // Write a pointer to the wrapper object at the beginning of the code page
+    *((VALUE*)code_page->mem_block) = cp_obj;
+
+    return cp_obj;
+}
+
+// Unwrap the Ruby object representing a code page
+code_page_t *rb_yjit_code_page_unwrap(VALUE cp_obj)
+{
+    code_page_t * code_page;
+    TypedData_Get_Struct(cp_obj, code_page_t, &yjit_code_page_type, code_page);
+    return code_page;
+}
+
+// Get the code page wrapper object for a code pointer
+VALUE rb_yjit_code_page_from_ptr(uint8_t* code_ptr)
+{
+    VALUE* page_start = (VALUE*)((intptr_t)code_ptr & ~(CODE_PAGE_SIZE - 1));
+    VALUE wrapper = *page_start;
+    return wrapper;
+}
+
+// Get the inline code block corresponding to a code pointer
+void rb_yjit_get_cb(codeblock_t* cb, uint8_t* code_ptr)
+{
+    VALUE page_wrapper = rb_yjit_code_page_from_ptr(code_ptr);
+    code_page_t *code_page = rb_yjit_code_page_unwrap(page_wrapper);
+
+    // A pointer to the page wrapper object is written at the start of the code page
+    uint8_t* mem_block = code_page->mem_block + sizeof(VALUE);
+    uint32_t mem_size = (code_page->page_size/2) - sizeof(VALUE);
+    RUBY_ASSERT(mem_block);
+
+    // Map the code block to this memory region
+    cb_init(cb, mem_block, mem_size);
+}
+
+// Get the outlined code block corresponding to a code pointer
+void rb_yjit_get_ocb(codeblock_t* cb, uint8_t* code_ptr)
+{
+    VALUE page_wrapper = rb_yjit_code_page_from_ptr(code_ptr);
+    code_page_t *code_page = rb_yjit_code_page_unwrap(page_wrapper);
+
+    // A pointer to the page wrapper object is written at the start of the code page
+    uint8_t* mem_block = code_page->mem_block + (code_page->page_size/2);
+    uint32_t mem_size = code_page->page_size/2;
+    RUBY_ASSERT(mem_block);
+
+    // Map the code block to this memory region
+    cb_init(cb, mem_block, mem_size);
 }
 
 bool
@@ -1038,22 +1169,82 @@ rb_yjit_call_threshold(void)
     return rb_yjit_opts.call_threshold;
 }
 
+# define PTR2NUM(x)   (LONG2NUM((long)(x)))
+
+/**
+ *  call-seq: block.id -> unique_id
+ *
+ *  Returns a unique integer ID for the block.  For example:
+ *
+ *      blocks = blocks_for(iseq)
+ *      blocks.group_by(&:id)
+ */
+static VALUE
+block_id(VALUE self)
+{
+    block_t * block;
+    TypedData_Get_Struct(self, block_t, &yjit_block_type, block);
+    return PTR2NUM(block);
+}
+
+/**
+ *  call-seq: block.outgoing -> list
+ *
+ *  Returns a list of outgoing blocks for the current block.  This list can be
+ *  used in conjunction with Block#id to construct a graph of block objects.
+ */
+static VALUE
+outgoing(VALUE self)
+{
+    block_t * block;
+    TypedData_Get_Struct(self, block_t, &yjit_block_type, block);
+
+    VALUE outgoing_blocks = rb_ary_new();
+
+    rb_darray_for(block->outgoing, branch_idx) {
+        branch_t* out_branch = rb_darray_get(block->outgoing, branch_idx);
+
+        for (size_t succ_idx = 0; succ_idx < 2; succ_idx++) {
+            block_t* succ = out_branch->blocks[succ_idx];
+
+            if (succ == NULL)
+                continue;
+
+            rb_ary_push(outgoing_blocks, succ->self);
+        }
+    }
+
+    return outgoing_blocks;
+}
+
+// Can raise RuntimeError
 void
 rb_yjit_init(struct rb_yjit_options *options)
 {
-    if (!yjit_scrape_successful || !PLATFORM_SUPPORTED_P) {
+    if (!PLATFORM_SUPPORTED_P || !JIT_ENABLED) {
         return;
     }
 
     rb_yjit_opts = *options;
     rb_yjit_opts.yjit_enabled = true;
 
-    // Normalize command-line options
-    if (rb_yjit_opts.call_threshold < 1) {
-        rb_yjit_opts.call_threshold = 2;
+    rb_yjit_opts.gen_stats |= !!getenv("YJIT_STATS");
+
+#if !YJIT_STATS
+    if(rb_yjit_opts.gen_stats) {
+        rb_warning("--yjit-stats requires that Ruby is compiled with CPPFLAGS='-DYJIT_STATS=1' or CPPFLAGS='-DRUBY_DEBUG=1'");
     }
-    if (rb_yjit_opts.version_limit < 1) {
-        rb_yjit_opts.version_limit = 4;
+#endif
+
+    // Normalize command-line options to default values
+    if (rb_yjit_opts.exec_mem_size < 1) {
+        rb_yjit_opts.exec_mem_size = 256;
+    }
+    if (rb_yjit_opts.call_threshold < 1) {
+        rb_yjit_opts.call_threshold = YJIT_DEFAULT_CALL_THRESHOLD;
+    }
+    if (rb_yjit_opts.max_versions < 1) {
+        rb_yjit_opts.max_versions = 4;
     }
 
     blocks_assuming_stable_global_constant_state = st_init_numtable();
@@ -1066,13 +1257,16 @@ rb_yjit_init(struct rb_yjit_options *options)
     // YJIT Ruby module
     mYjit = rb_define_module("YJIT");
     rb_define_module_function(mYjit, "blocks_for", yjit_blocks_for, 1);
+    rb_define_module_function(mYjit, "entry_blocks_for", yjit_entry_blocks_for, 1);
 
     // YJIT::Block (block version, code block)
     cYjitBlock = rb_define_class_under(mYjit, "Block", rb_cObject);
     rb_define_method(cYjitBlock, "address", block_address, 0);
+    rb_define_method(cYjitBlock, "id", block_id, 0);
     rb_define_method(cYjitBlock, "code", block_code, 0);
     rb_define_method(cYjitBlock, "iseq_start_index", iseq_start_index, 0);
     rb_define_method(cYjitBlock, "iseq_end_index", iseq_end_index, 0);
+    rb_define_method(cYjitBlock, "outgoing", outgoing, 0);
 
     // YJIT disassembler interface
 #ifdef HAVE_LIBCAPSTONE
@@ -1081,11 +1275,11 @@ rb_yjit_init(struct rb_yjit_options *options)
     rb_define_method(cYjitDisasm, "disasm", yjit_disasm, 2);
     cYjitDisasmInsn = rb_struct_define_under(cYjitDisasm, "Insn", "address", "mnemonic", "op_str", NULL);
 #if RUBY_DEBUG
-    cYjitCodeComment = rb_struct_define_under(cYjitDisasm, "Comment", "address", "comment");
+    cYjitCodeComment = rb_struct_define_under(cYjitDisasm, "Comment", "address", "comment", NULL);
 #endif
 #endif
 
-    if (RUBY_DEBUG && rb_yjit_opts.gen_stats) {
+    if (YJIT_STATS && rb_yjit_opts.gen_stats) {
         // Setup at_exit callback for printing out counters
         rb_block_call(rb_mKernel, rb_intern("at_exit"), 0, NULL, at_exit_print_stats, Qfalse);
     }

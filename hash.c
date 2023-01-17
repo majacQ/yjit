@@ -52,11 +52,6 @@
 #include "gc.h"
 #endif
 
-#define HAS_EXTRA_STATES(hash, klass) ( \
-    ((klass = has_extra_methods(rb_obj_class(hash))) != 0) || \
-    FL_TEST((hash), FL_EXIVAR|RHASH_PROC_DEFAULT) || \
-    !NIL_P(RHASH_IFNONE(hash)))
-
 #define SET_DEFAULT(hash, ifnone) ( \
     FL_UNSET_RAW(hash, RHASH_PROC_DEFAULT), \
     RHASH_SET_IFNONE(hash, ifnone))
@@ -71,18 +66,6 @@ copy_default(struct RHash *hash, const struct RHash *hash2)
     hash->basic.flags &= ~RHASH_PROC_DEFAULT;
     hash->basic.flags |= hash2->basic.flags & RHASH_PROC_DEFAULT;
     RHASH_SET_IFNONE(hash, RHASH_IFNONE((VALUE)hash2));
-}
-
-static VALUE
-has_extra_methods(VALUE klass)
-{
-    const VALUE base = rb_cHash;
-    VALUE c = klass;
-    while (c != base) {
-	if (rb_class_has_methods(c)) return klass;
-	c = RCLASS_SUPER(c);
-    }
-    return 0;
 }
 
 static VALUE rb_hash_s_try_convert(VALUE, VALUE);
@@ -1520,11 +1503,16 @@ rb_hash_foreach(VALUE hash, rb_foreach_func *func, VALUE farg)
 
     if (RHASH_TABLE_EMPTY_P(hash))
         return;
-    hash_iter_lev_inc(hash);
     arg.hash = hash;
     arg.func = (rb_foreach_func *)func;
     arg.arg  = farg;
-    rb_ensure(hash_foreach_call, (VALUE)&arg, hash_foreach_ensure, hash);
+    if (RB_OBJ_FROZEN(hash)) {
+        hash_foreach_call((VALUE)&arg);
+    }
+    else {
+        hash_iter_lev_inc(hash);
+        rb_ensure(hash_foreach_call, (VALUE)&arg, hash_foreach_ensure, hash);
+    }
     hash_verify(hash);
 }
 
@@ -1559,6 +1547,17 @@ rb_hash_new(void)
     return hash_alloc(rb_cHash);
 }
 
+static VALUE rb_hash_compare_by_id(VALUE hash);
+
+static VALUE
+copy_compare_by_id(VALUE hash, VALUE basis)
+{
+    if (rb_hash_compare_by_id_p(basis)) {
+        return rb_hash_compare_by_id(hash);
+    }
+    return hash;
+}
+
 MJIT_FUNC_EXPORTED VALUE
 rb_hash_new_with_size(st_index_t size)
 {
@@ -1585,6 +1584,12 @@ hash_copy(VALUE ret, VALUE hash)
             RHASH_ST_TABLE_SET(ret, st_copy(RHASH_ST_TABLE(hash)));
     }
     return ret;
+}
+
+static VALUE
+hash_dup_with_compare_by_id(VALUE hash)
+{
+    return hash_copy(copy_compare_by_id(rb_hash_new(), hash), hash);
 }
 
 static VALUE
@@ -1675,7 +1680,7 @@ int
 rb_hash_stlike_update(VALUE hash, st_data_t key, st_update_callback_func *func, st_data_t arg)
 {
     if (RHASH_AR_TABLE_P(hash)) {
-        int result = ar_update(hash, (st_data_t)key, func, arg);
+        int result = ar_update(hash, key, func, arg);
         if (result == -1) {
             ar_try_convert_table(hash);
         }
@@ -1684,7 +1689,7 @@ rb_hash_stlike_update(VALUE hash, st_data_t key, st_update_callback_func *func, 
         }
     }
 
-    return st_update(RHASH_ST_TABLE(hash), (st_data_t)key, func, arg);
+    return st_update(RHASH_ST_TABLE(hash), key, func, arg);
 }
 
 static int
@@ -1814,21 +1819,27 @@ rb_hash_initialize(int argc, VALUE *argv, VALUE hash)
  *
  *  With no argument, returns a new empty \Hash.
  *
- *  When the single given argument is a \Hash,
- *  returns a new \Hash populated with the entries from the given \Hash.
+ *  When the single given argument is a \Hash, returns a new \Hash
+ *  populated with the entries from the given \Hash, excluding the
+ *  default value or proc.
+ *
  *    h = {foo: 0, bar: 1, baz: 2}
  *    Hash[h] # => {:foo=>0, :bar=>1, :baz=>2}
  *
  *  When the single given argument is an \Array of 2-element Arrays,
- *  returns a new \Hash object wherein each 2-element array forms a key-value entry:
+ *  returns a new \Hash object wherein each 2-element array forms a
+ *  key-value entry:
+ *
  *    Hash[ [ [:foo, 0], [:bar, 1] ] ] # => {:foo=>0, :bar=>1}
  *
  *  When the argument count is an even number;
  *  returns a new \Hash object wherein each successive pair of arguments
  *  has become a key-value entry:
+ *
  *    Hash[:foo, 0, :bar, 1] # => {:foo=>0, :bar=>1}
  *
- *  Raises an exception if the argument list does not conform to any of the above.
+ *  Raises an exception if the argument list does not conform to any
+ *  of the above.
  */
 
 static VALUE
@@ -1933,7 +1944,7 @@ static VALUE
 rb_hash_s_ruby2_keywords_hash_p(VALUE dummy, VALUE hash)
 {
     Check_Type(hash, T_HASH);
-    return (RHASH(hash)->basic.flags & RHASH_PASS_AS_KEYWORDS) ? Qtrue : Qfalse;
+    return RBOOL(RHASH(hash)->basic.flags & RHASH_PASS_AS_KEYWORDS);
 }
 
 /*
@@ -2333,7 +2344,7 @@ rb_hash_stlike_delete(VALUE hash, st_data_t *pkey, st_data_t *pval)
 }
 
 /*
- * delete a specified entry a given key.
+ * delete a specified entry by a given key.
  * if there is the corresponding entry, return a value of the entry.
  * if there is no corresponding entry, return Qundef.
  */
@@ -2547,7 +2558,7 @@ rb_hash_delete_if(VALUE hash)
  *    e.each {|key, value| key.start_with?('b') } # => {:foo=>0}
  */
 
-VALUE
+static VALUE
 rb_hash_reject_bang(VALUE hash)
 {
     st_index_t n;
@@ -2579,19 +2590,13 @@ rb_hash_reject_bang(VALUE hash)
  *    h1 # => {:foo=>0}
  */
 
-VALUE
+static VALUE
 rb_hash_reject(VALUE hash)
 {
     VALUE result;
 
     RETURN_SIZED_ENUMERATOR(hash, 0, 0, hash_enum_size);
-    if (RTEST(ruby_verbose)) {
-	VALUE klass;
-	if (HAS_EXTRA_STATES(hash, klass)) {
-	    rb_warn("extra states are no longer copied: %+"PRIsVALUE, hash);
-	}
-    }
-    result = hash_copy(hash_alloc(rb_cHash), hash);
+    result = hash_dup_with_compare_by_id(hash);
     if (!RHASH_EMPTY_P(hash)) {
 	rb_hash_foreach(result, delete_if_i, result);
     }
@@ -2616,9 +2621,9 @@ rb_hash_slice(int argc, VALUE *argv, VALUE hash)
     VALUE key, value, result;
 
     if (argc == 0 || RHASH_EMPTY_P(hash)) {
-	return rb_hash_new();
+        return copy_compare_by_id(rb_hash_new(), hash);
     }
-    result = rb_hash_new_with_size(argc);
+    result = copy_compare_by_id(rb_hash_new_with_size(argc), hash);
 
     for (i = 0; i < argc; i++) {
 	key = argv[i];
@@ -2647,8 +2652,7 @@ rb_hash_except(int argc, VALUE *argv, VALUE hash)
     int i;
     VALUE key, result;
 
-    result = hash_alloc(rb_cHash);
-    hash_copy(result, hash);
+    result = hash_dup_with_compare_by_id(hash);
 
     for (i = 0; i < argc; i++) {
         key = argv[i];
@@ -2671,7 +2675,7 @@ rb_hash_except(int argc, VALUE *argv, VALUE hash)
  *    h.values_at(:hello, :foo) # => [nil, 0]
  */
 
-VALUE
+static VALUE
 rb_hash_values_at(int argc, VALUE *argv, VALUE hash)
 {
     VALUE result = rb_ary_new2(argc);
@@ -2748,7 +2752,7 @@ rb_hash_select(VALUE hash)
     VALUE result;
 
     RETURN_SIZED_ENUMERATOR(hash, 0, 0, hash_enum_size);
-    result = hash_copy(hash_alloc(rb_cHash), hash);
+    result = hash_dup_with_compare_by_id(hash);
     if (!RHASH_EMPTY_P(hash)) {
 	rb_hash_foreach(result, keep_if_i, result);
     }
@@ -2947,25 +2951,17 @@ rb_hash_replace(VALUE hash, VALUE hash2)
     COPY_DEFAULT(hash, hash2);
 
     if (RHASH_AR_TABLE_P(hash)) {
-        if (RHASH_AR_TABLE_P(hash2)) {
-            ar_clear(hash);
-        }
-        else {
-            ar_free_and_clear_table(hash);
-            RHASH_ST_TABLE_SET(hash, st_init_table_with_size(RHASH_TYPE(hash2), RHASH_SIZE(hash2)));
-        }
+        ar_free_and_clear_table(hash);
     }
     else {
-        if (RHASH_AR_TABLE_P(hash2)) {
-            st_free_table(RHASH_ST_TABLE(hash));
-            RHASH_ST_CLEAR(hash);
-        }
-        else {
-            st_clear(RHASH_ST_TABLE(hash));
-            RHASH_TBL_RAW(hash)->type = RHASH_ST_TABLE(hash2)->type;
-        }
+        st_free_table(RHASH_ST_TABLE(hash));
+        RHASH_ST_CLEAR(hash);
     }
     hash_copy(hash, hash2);
+    if (RHASH_EMPTY_P(hash2) && RHASH_ST_TABLE_P(hash2)) {
+        /* ident hash */
+        RHASH_ST_TABLE_SET(hash, st_init_table_with_size(RHASH_TYPE(hash2), 0));
+    }
 
     rb_gc_writebarrier_remember(hash);
 
@@ -3007,7 +3003,7 @@ rb_hash_size_num(VALUE hash)
 static VALUE
 rb_hash_empty_p(VALUE hash)
 {
-    return RHASH_EMPTY_P(hash) ? Qtrue : Qfalse;
+    return RBOOL(RHASH_EMPTY_P(hash));
 }
 
 static int
@@ -3293,7 +3289,6 @@ rb_hash_transform_keys_bang(int argc, VALUE *argv, VALUE hash)
             rb_hash_aset(new_keys, new_key, Qnil);
         }
         rb_ary_clear(pairs);
-        rb_gc_force_recycle(pairs);
         rb_hash_clear(new_keys);
         rb_gc_force_recycle(new_keys);
     }
@@ -3342,7 +3337,7 @@ rb_hash_transform_values(VALUE hash)
     VALUE result;
 
     RETURN_SIZED_ENUMERATOR(hash, 0, 0, hash_enum_size);
-    result = hash_copy(hash_alloc(rb_cHash), hash);
+    result = hash_dup_with_compare_by_id(hash);
     SET_DEFAULT(result, Qnil);
 
     if (!RHASH_EMPTY_P(hash)) {
@@ -3645,12 +3640,7 @@ rb_hash_values(VALUE hash)
 MJIT_FUNC_EXPORTED VALUE
 rb_hash_has_key(VALUE hash, VALUE key)
 {
-    if (hash_stlike_lookup(hash, key, NULL)) {
-        return Qtrue;
-    }
-    else {
-        return Qfalse;
-    }
+    return RBOOL(hash_stlike_lookup(hash, key, NULL));
 }
 
 static int
@@ -4096,7 +4086,7 @@ rb_hash_update_by(VALUE hash1, VALUE hash2, rb_hash_update_func *func)
 static VALUE
 rb_hash_merge(int argc, VALUE *argv, VALUE self)
 {
-    return rb_hash_update(argc, argv, rb_hash_dup(self));
+    return rb_hash_update(argc, argv, copy_compare_by_id(rb_hash_dup(self), self));
 }
 
 static int
@@ -4149,7 +4139,7 @@ assoc_i(VALUE key, VALUE val, VALUE arg)
  *  Returns +nil+ if key +key+ is not found.
  */
 
-VALUE
+static VALUE
 rb_hash_assoc(VALUE hash, VALUE key)
 {
     st_table *table;
@@ -4210,7 +4200,7 @@ rassoc_i(VALUE key, VALUE val, VALUE arg)
  *  Returns +nil+ if no such value found.
  */
 
-VALUE
+static VALUE
 rb_hash_rassoc(VALUE hash, VALUE obj)
 {
     VALUE args[2];
@@ -4424,12 +4414,7 @@ rb_hash_compare_by_id(VALUE hash)
 MJIT_FUNC_EXPORTED VALUE
 rb_hash_compare_by_id_p(VALUE hash)
 {
-    if (RHASH_ST_TABLE_P(hash) && RHASH_ST_TABLE(hash)->type == &identhash) {
-	return Qtrue;
-    }
-    else {
-        return Qfalse;
-    }
+    return RBOOL(RHASH_ST_TABLE_P(hash) && RHASH_ST_TABLE(hash)->type == &identhash);
 }
 
 VALUE
@@ -5043,7 +5028,7 @@ env_fetch(int argc, VALUE *argv, VALUE _)
 int
 rb_env_path_tainted(void)
 {
-    rb_warn_deprecated_to_remove("rb_env_path_tainted", "3.2");
+    rb_warn_deprecated_to_remove_at(3.2, "rb_env_path_tainted", NULL);
     return 0;
 }
 
@@ -6031,8 +6016,7 @@ env_has_key(VALUE env, VALUE key)
     const char *s;
 
     s = env_name(key);
-    if (getenv(s)) return Qtrue;
-    return Qfalse;
+    return RBOOL(getenv(s));
 }
 
 /*
@@ -6488,6 +6472,47 @@ env_update(VALUE env, VALUE hash)
 }
 
 /*
+ * call-seq:
+ *   ENV.clone(freeze: nil) -> ENV
+ *
+ * Returns ENV itself, and warns because ENV is a wrapper for the
+ * process-wide environment variables and a clone is useless.
+ * If +freeze+ keyword is given and not +nil+ or +false+, raises ArgumentError.
+ * If +freeze+ keyword is given and +true+, raises TypeError, as ENV storage
+ * cannot be frozen.
+ */
+static VALUE
+env_clone(int argc, VALUE *argv, VALUE obj)
+{
+    if (argc) {
+        VALUE opt, kwfreeze;
+        if (rb_scan_args(argc, argv, "0:", &opt) < argc) {
+            kwfreeze = rb_get_freeze_opt(1, &opt);
+            if (RTEST(kwfreeze)) {
+                rb_raise(rb_eTypeError, "cannot freeze ENV");
+            }
+        }
+    }
+
+    rb_warn_deprecated("ENV.clone", "ENV.to_h");
+    return envtbl;
+}
+
+NORETURN(static VALUE env_dup(VALUE));
+/*
+ * call-seq:
+ *   ENV.dup # raises TypeError
+ *
+ * Raises TypeError, because ENV is a singleton object.
+ * Use #to_h to get a copy of ENV data as a hash.
+ */
+static VALUE
+env_dup(VALUE obj)
+{
+    rb_raise(rb_eTypeError, "Cannot dup ENV, use ENV.to_h to get a copy of ENV as a hash");
+}
+
+/*
  *  A \Hash maps each of its unique keys to a specific value.
  *
  *  A \Hash has certain similarities to an \Array, but:
@@ -6829,8 +6854,11 @@ env_update(VALUE env, VALUE hash)
  *
  *  === What's Here
  *
- *  First, what's elsewhere. \Hash includes the module Enumerable,
- *  which provides dozens of additional methods.
+ *  First, what's elsewhere. \Class \Hash:
+ *
+ *  - Inherits from {class Object}[Object.html#class-Object-label-What-27s+Here].
+ *  - Includes {module Enumerable}[Enumerable.html#module-Enumerable-label-What-27s+Here],
+ *    which provides dozens of additional methods.
  *
  *  Here, class \Hash provides methods that are useful for:
  *
@@ -7193,6 +7221,14 @@ Init_Hash(void)
     rb_define_singleton_method(envtbl, "to_h", env_to_h, 0);
     rb_define_singleton_method(envtbl, "assoc", env_assoc, 1);
     rb_define_singleton_method(envtbl, "rassoc", env_rassoc, 1);
+    rb_define_singleton_method(envtbl, "clone", env_clone, -1);
+    rb_define_singleton_method(envtbl, "dup", env_dup, 0);
+
+    VALUE envtbl_class = rb_singleton_class(envtbl);
+    rb_undef_method(envtbl_class, "initialize");
+    rb_undef_method(envtbl_class, "initialize_clone");
+    rb_undef_method(envtbl_class, "initialize_copy");
+    rb_undef_method(envtbl_class, "initialize_dup");
 
     /*
      * ENV is a Hash-like accessor for environment variables.

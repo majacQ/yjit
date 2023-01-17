@@ -1,6 +1,6 @@
 # frozen_string_literal: true
 
-require 'rubygems/test_case'
+require_relative 'helper'
 require 'rubygems/commands/setup_command'
 
 class TestGemCommandsSetupCommand < Gem::TestCase
@@ -21,7 +21,7 @@ class TestGemCommandsSetupCommand < Gem::TestCase
     filelist = %w[
       bin/gem
       lib/rubygems.rb
-      lib/rubygems/test_case.rb
+      lib/rubygems/requirement.rb
       lib/rubygems/ssl_certs/rubygems.org/foo.pem
       bundler/exe/bundle
       bundler/exe/bundler
@@ -159,7 +159,7 @@ class TestGemCommandsSetupCommand < Gem::TestCase
   end
 
   def test_files_in
-    assert_equal %w[rubygems.rb rubygems/ssl_certs/rubygems.org/foo.pem rubygems/test_case.rb],
+    assert_equal %w[rubygems.rb rubygems/requirement.rb rubygems/ssl_certs/rubygems.org/foo.pem],
                  @cmd.files_in('lib').sort
   end
 
@@ -175,7 +175,7 @@ class TestGemCommandsSetupCommand < Gem::TestCase
       assert_path_exist File.join(dir, 'bundler.rb')
       assert_path_exist File.join(dir, 'bundler/b.rb')
 
-      assert_path_exist File.join(dir, 'bundler/templates/.circleci/config.yml') unless RUBY_ENGINE == "truffleruby" # https://github.com/oracle/truffleruby/issues/2116
+      assert_path_exist File.join(dir, 'bundler/templates/.circleci/config.yml')
       assert_path_exist File.join(dir, 'bundler/templates/.travis.yml')
     end
   end
@@ -272,7 +272,7 @@ class TestGemCommandsSetupCommand < Gem::TestCase
 
     @cmd.remove_old_lib_files lib
 
-    files_that_go.each {|file| assert_path_not_exist(file) unless file == old_bundler_ci && RUBY_ENGINE == "truffleruby" } # https://github.com/oracle/truffleruby/issues/2116
+    files_that_go.each {|file| assert_path_not_exist(file) unless file == old_bundler_ci }
 
     files_that_stay.each {|file| assert_path_exist file }
   end

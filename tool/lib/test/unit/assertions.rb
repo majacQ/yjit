@@ -1,6 +1,6 @@
 # frozen_string_literal: true
 require 'minitest/unit'
-require 'test/unit/core_assertions'
+require_relative '../../core_assertions'
 require 'pp'
 
 module Test
@@ -215,16 +215,6 @@ EOT
       alias assert_include assert_includes
       alias assert_not_include assert_not_includes
 
-      def assert_all?(obj, m = nil, &blk)
-        failed = []
-        obj.each do |*a, &b|
-          unless blk.call(*a, &b)
-            failed << (a.size > 1 ? a : a[0])
-          end
-        end
-        assert(failed.empty?, message(m) {failed.pretty_inspect})
-      end
-
       def assert_not_all?(obj, m = nil, &blk)
         failed = []
         obj.each do |*a, &b|
@@ -313,5 +303,10 @@ EOT
         template.gsub(/\G((?:[^\\]|\\.)*?)(\\)?\?/) { $1 + ($2 ? "?" : mu_pp(arguments.shift)) }
       end
     end
+
+    # Compatibility hack for assert_raise
+    AssertionFailedError = MiniTest::Assertion
+    PendedError = MiniTest::Skip
+
   end
 end

@@ -2234,14 +2234,6 @@ rb_ary_set_len(VALUE ary, long len)
     ARY_SET_LEN(ary, len);
 }
 
-/*!
- * expands or shrinks \a ary to \a len elements.
- * expanded region will be filled with Qnil.
- * \param ary  an array
- * \param len  new size
- * \return     \a ary
- * \post       the size of \a ary is \a len.
- */
 VALUE
 rb_ary_resize(VALUE ary, long len)
 {
@@ -2668,9 +2660,7 @@ rb_ary_length(VALUE ary)
 static VALUE
 rb_ary_empty_p(VALUE ary)
 {
-    if (RARRAY_LEN(ary) == 0)
-	return Qtrue;
-    return Qfalse;
+    return RBOOL(RARRAY_LEN(ary) == 0);
 }
 
 VALUE
@@ -3074,11 +3064,13 @@ ary_rotate_ptr(VALUE *ptr, long len, long cnt)
         VALUE tmp = *ptr;
         memmove(ptr, ptr + 1, sizeof(VALUE)*(len - 1));
         *(ptr + len - 1) = tmp;
-    } else if (cnt == len - 1) {
+    }
+    else if (cnt == len - 1) {
         VALUE tmp = *(ptr + len - 1);
         memmove(ptr + 1, ptr, sizeof(VALUE)*(len - 1));
         *ptr = tmp;
-    } else {
+    }
+    else {
         --len;
         if (cnt < len) ary_reverse(ptr + cnt, ptr + len);
         if (--cnt > 0) ary_reverse(ptr, ptr + cnt);
@@ -3213,6 +3205,7 @@ rb_ary_rotate_m(int argc, VALUE *argv, VALUE ary)
 
 struct ary_sort_data {
     VALUE ary;
+    VALUE receiver;
     struct cmp_opt_data cmp_opt;
 };
 
@@ -3223,6 +3216,15 @@ sort_reentered(VALUE ary)
 	rb_raise(rb_eRuntimeError, "sort reentered");
     }
     return Qnil;
+}
+
+static void
+sort_returned(struct ary_sort_data *data)
+{
+    if (rb_obj_frozen_p(data->receiver)) {
+        rb_raise(rb_eFrozenError, "array frozen during sort");
+    }
+    sort_reentered(data->ary);
 }
 
 static int
@@ -3238,7 +3240,7 @@ sort_1(const void *ap, const void *bp, void *dummy)
     args[1] = b;
     retval = rb_yield_values2(2, args);
     n = rb_cmpint(retval, a, b);
-    sort_reentered(data->ary);
+    sort_returned(data);
     return n;
 }
 
@@ -3264,7 +3266,7 @@ sort_2(const void *ap, const void *bp, void *dummy)
 
     retval = rb_funcallv(a, id_cmp, 1, &b);
     n = rb_cmpint(retval, a, b);
-    sort_reentered(data->ary);
+    sort_returned(data);
 
     return n;
 }
@@ -3316,6 +3318,7 @@ rb_ary_sort_bang(VALUE ary)
 	long len = RARRAY_LEN(ary);
 	RBASIC_CLEAR_CLASS(tmp);
 	data.ary = tmp;
+        data.receiver = ary;
 	data.cmp_opt.opt_methods = 0;
 	data.cmp_opt.opt_inited = 0;
 	RARRAY_PTR_USE(tmp, ptr, {
@@ -4085,7 +4088,7 @@ ary_slice_bang_by_rb_ary_splice(VALUE ary, long pos, long len)
     else if (orig_len < pos) {
         return Qnil;
     }
-    else if (orig_len < pos + len) {
+    if (orig_len < pos + len) {
         len = orig_len - pos;
     }
     if (len == 0) {
@@ -4834,6 +4837,7 @@ ary_append(VALUE x, VALUE y)
     if (n > 0) {
         rb_ary_splice(x, RARRAY_LEN(x), 0, RARRAY_CONST_PTR_TRANSIENT(y), n);
     }
+    RB_GC_GUARD(y);
     return x;
 }
 
@@ -5910,8 +5914,7 @@ ary_min_opt_string(VALUE ary, long i, VALUE vmin)
  *
  *  With an argument +n+ and a block, returns a new \Array with at most +n+ elements,
  *  in ascending order per the block:
- *    [0, 1, 2, 3].min(3) # => [0, 1, 2]
- *    [0, 1, 2, 3].min(6) # => [0, 1, 2, 3]
+ *    ['0', '00', '000'].min(2) {|a, b| a.size <=> b.size } # => ["0", "00"]
  */
 static VALUE
 rb_ary_min(int argc, VALUE *argv, VALUE ary)
@@ -8147,8 +8150,11 @@ rb_ary_deconstruct(VALUE ary)
  *
  *  == What's Here
  *
- *  First, what's elsewhere. \Array includes the module Enumerable,
- *  which provides dozens of additional methods.
+ *  First, what's elsewhere. \Class \Array:
+ *
+ *  - Inherits from {class Object}[Object.html#class-Object-label-What-27s+Here].
+ *  - Includes {module Enumerable}[Enumerable.html#module-Enumerable-label-What-27s+Here],
+ *    which provides dozens of additional methods.
  *
  *  Here, class \Array provides methods that are useful for:
  *
@@ -8368,7 +8374,7 @@ Init_Array(void)
     rb_define_method(rb_cArray, "each_index", rb_ary_each_index, 0);
     rb_define_method(rb_cArray, "reverse_each", rb_ary_reverse_each, 0);
     rb_define_method(rb_cArray, "length", rb_ary_length, 0);
-    rb_define_alias(rb_cArray,  "size", "length");
+    rb_define_method(rb_cArray, "size", rb_ary_length, 0);
     rb_define_method(rb_cArray, "empty?", rb_ary_empty_p, 0);
     rb_define_method(rb_cArray, "find_index", rb_ary_index, -1);
     rb_define_method(rb_cArray, "index", rb_ary_index, -1);

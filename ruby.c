@@ -95,6 +95,8 @@ void rb_warning_category_update(unsigned int mask, unsigned int bits);
 #define EACH_FEATURES(X, SEP) \
     X(gems) \
     SEP \
+    X(error_highlight) \
+    SEP \
     X(did_you_mean) \
     SEP \
     X(rubyopt) \
@@ -217,6 +219,7 @@ enum {
 #endif
 	& ~FEATURE_BIT(frozen_string_literal)
         & ~FEATURE_BIT(jit)
+        & ~FEATURE_BIT(yjit)
 	)
 };
 
@@ -231,8 +234,9 @@ cmdline_options_init(ruby_cmdline_options_t *opt)
     opt->features.set = DEFAULT_FEATURES;
 #ifdef MJIT_FORCE_ENABLE /* to use with: ./configure cppflags="-DMJIT_FORCE_ENABLE" */
     opt->features.set |= FEATURE_BIT(jit);
-#endif
+#else
     opt->features.set |= FEATURE_BIT(yjit);
+#endif
     return opt;
 }
 
@@ -326,6 +330,7 @@ usage(const char *name, int help, int highlight, int columns)
     };
     static const struct message features[] = {
 	M("gems",    "",        "rubygems (only for debugging, default: "DEFAULT_RUBYGEMS_ENABLED")"),
+	M("error_highlight", "", "error_highlight (default: "DEFAULT_RUBYGEMS_ENABLED")"),
 	M("did_you_mean", "",   "did_you_mean (default: "DEFAULT_RUBYGEMS_ENABLED")"),
 	M("rubyopt", "",        "RUBYOPT environment variable (default: enabled)"),
 	M("frozen-string-literal", "", "freeze all string literals (default: disabled)"),
@@ -922,6 +927,7 @@ feature_option(const char *str, int len, void *arg, const unsigned int enable)
     if (NAME_MATCH_P(#bit, str, len)) {set |= mask = FEATURE_BIT(bit); FEATURE_FOUND;}
     EACH_FEATURES(SET_FEATURE, ;);
     if (NAME_MATCH_P("all", str, len)) {
+        mask &= ~(FEATURE_BIT(jit));
         goto found;
     }
 #if AMBIGUOUS_FEATURE_NAMES
@@ -938,6 +944,8 @@ feature_option(const char *str, int len, void *arg, const unsigned int enable)
 	rb_exc_raise(rb_exc_new_str(rb_eRuntimeError, mesg));
 #undef ADD_FEATURE_NAME
     }
+#else
+    (void)set;
 #endif
     rb_warn("unknown argument for --%s: `%.*s'",
 	    enable ? "enable" : "disable", len, str);
@@ -1031,17 +1039,23 @@ setup_yjit_options(const char *s, struct rb_yjit_options *yjit_opt)
     if (*s != '-') return;
     const size_t l = strlen(++s);
 
-    if (opt_match_arg(s, l, "call-threshold")) {
+    if (opt_match_arg(s, l, "exec-mem-size")) {
+        yjit_opt->exec_mem_size = atoi(s + 1);
+    }
+    else if (opt_match_arg(s, l, "call-threshold")) {
         yjit_opt->call_threshold = atoi(s + 1);
     }
-    else if (opt_match_arg(s, l, "version-limit")) {
-        yjit_opt->version_limit = atoi(s + 1);
+    else if (opt_match_arg(s, l, "max-versions")) {
+        yjit_opt->max_versions = atoi(s + 1);
     }
     else if (opt_match_noarg(s, l, "greedy-versioning")) {
         yjit_opt->greedy_versioning = true;
     }
     else if (opt_match_noarg(s, l, "stats")) {
         yjit_opt->gen_stats = true;
+    }
+    else if (opt_match_noarg(s, l, "test-backend")) {
+        yjit_opt->test_backend = true;
     }
     else {
         rb_raise(rb_eRuntimeError,
@@ -1544,6 +1558,9 @@ ruby_opt_init(ruby_cmdline_options_t *opt)
 
     if (opt->features.set & FEATURE_BIT(gems)) {
         rb_define_module("Gem");
+        if (opt->features.set & FEATURE_BIT(error_highlight)) {
+            rb_define_module("ErrorHighlight");
+        }
         if (opt->features.set & FEATURE_BIT(did_you_mean)) {
             rb_define_module("DidYouMean");
         }
@@ -1810,13 +1827,20 @@ process_options(int argc, char **argv, ruby_cmdline_options_t *opt)
          */
         rb_warning("-K is specified; it is for 1.8 compatibility and may cause odd behavior");
 
-    if (opt->features.set & FEATURE_BIT(yjit))
-        rb_yjit_init(&opt->yjit);
 #if USE_MJIT
     if (opt->features.set & FEATURE_BIT(jit)) {
         opt->mjit.on = TRUE; /* set mjit.on for ruby_show_version() API and check to call mjit_init() */
     }
 #endif
+    if (opt->features.set & FEATURE_BIT(yjit)) {
+#if USE_MJIT
+        if (opt->mjit.on) {
+            rb_warn("MJIT and YJIT cannot both be enabled at the same time. Exiting");
+            exit(1);
+        }
+#endif
+        rb_yjit_init(&opt->yjit);
+    }
     if (opt->dump & (DUMP_BIT(version) | DUMP_BIT(version_v))) {
 #if USE_MJIT
         mjit_opts.on = opt->mjit.on; /* used by ruby_show_version(). mjit_init() still can't be called here. */
@@ -1956,7 +1980,7 @@ process_options(int argc, char **argv, ruby_cmdline_options_t *opt)
 	VALUE option = rb_hash_new();
 #define SET_COMPILE_OPTION(h, o, name) \
 	rb_hash_aset((h), ID2SYM(rb_intern_const(#name)),		\
-                     (FEATURE_SET_P(o->features, FEATURE_BIT(name)) ? Qtrue : Qfalse));
+                     RBOOL(FEATURE_SET_P(o->features, FEATURE_BIT(name))));
 	SET_COMPILE_OPTION(option, opt, frozen_string_literal);
 	SET_COMPILE_OPTION(option, opt, debug_frozen_string_literal);
 	rb_funcallv(rb_cISeq, rb_intern_const("compile_option="), 1, &option);
@@ -2089,6 +2113,7 @@ process_options(int argc, char **argv, ruby_cmdline_options_t *opt)
     rb_gvar_ractor_local("$-a");
 
     if ((rb_e_script = opt->e_script) != 0) {
+        rb_str_freeze(rb_e_script);
         rb_gc_register_mark_object(opt->e_script);
     }
 
@@ -2342,7 +2367,7 @@ open_load_file(VALUE fname_v, int *xflag)
 	      We need to wait if FIFO is empty. It's FIFO's semantics.
 	      rb_thread_wait_fd() release GVL. So, it's safe.
 	    */
-	    rb_thread_wait_fd(fd);
+	    rb_io_wait(f, RB_INT2NUM(RUBY_IO_READABLE), Qnil);
 	}
     }
     return f;
@@ -2465,11 +2490,6 @@ external_str_new_cstr(const char *p)
 #endif
 }
 
-/*! Sets the current script name to this value.
- *
- * This is similar to <code>$0 = name</code> in Ruby level but also affects
- * <code>Method#location</code> and others.
- */
 void
 ruby_script(const char *name)
 {
@@ -2553,7 +2573,6 @@ debug_setter(VALUE val, ID id, VALUE *dmy)
     *rb_ruby_debug_ptr() = val;
 }
 
-/*! Defines built-in variables */
 void
 ruby_prog_init(void)
 {
@@ -2654,13 +2673,6 @@ fill_standard_fds(void)
     }
 }
 
-/*! Initializes the process for libruby.
- *
- * This function assumes this process is ruby(1) and it has just started.
- * Usually programs that embed CRuby interpreter may not call this function,
- * and may do their own initialization.
- * argc and argv cannot be NULL.
- */
 void
 ruby_sysinit(int *argc, char ***argv)
 {

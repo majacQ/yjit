@@ -10,6 +10,7 @@ CHDIR = cd
 PATH_SEPARATOR = ;
 TZ =				# skip timezone tests
 PWD = $(MAKEDIR)
+empty =
 
 !ifndef MFLAGS
 MFLAGS=-l
@@ -526,6 +527,14 @@ GOLF_PRELUDE_C = golf_prelude.c
 !endif
 RBCONFIG      = ./.rbconfig.time
 
+!if "$(GITHUB_ACTIONS)" == "true"
+ACTIONS_GROUP = @echo ^#^#[group]$(@:yes-=)
+ACTIONS_ENDGROUP = @echo ^#^#[endgroup]
+!else
+ACTIONS_GROUP = @:: $(empty)
+ACTIONS_ENDGROUP = @::
+!endif
+
 !include $(srcdir)/common.mk
 
 !ifdef SCRIPTPROGRAMS
@@ -700,7 +709,7 @@ $(CONFIG_H): $(MKFILES) $(srcdir)/win32/Makefile.sub $(win_srcdir)/Makefile.sub
 !else
 #define PACKED_STRUCT(x) x
 !endif
-!if "$(ARCH)" == "x86" || "$(ARCH)" == "x64"
+!if "$(MACHINE)" == "x86" || "$(ARCH)" == "x64"
 #define PACKED_STRUCT_UNALIGNED(x) PACKED_STRUCT(x)
 !else
 #define PACKED_STRUCT_UNALIGNED(x) x
@@ -982,6 +991,7 @@ s,@SOEXT@,dll,;t t
 s,@DLEXT@,so,;t t
 s,@LIBEXT@,lib,;t t
 s,@STRIP@,$(STRIP),;t t
+s,@ENCSTATIC@,$(ENCSTATIC),;t t
 s,@EXTSTATIC@,$(EXTSTATIC),;t t
 s,@setup@,Setup,;t t
 s,@MINIRUBY@,$(MINIRUBY),;t t
@@ -1222,9 +1232,6 @@ $(ruby_pc): $(RBCONFIG)
 {$(srcdir)/coroutine/win64}.asm{coroutine/win64}.obj:
 	$(ECHO) assembling $(<:\=/)
 	$(Q) $(AS) $(ASFLAGS) $(XCFLAGS) $(CPPFLAGS) $(COUTFLAG)$@ -c $(<:\=/)
-{$(srcdir)/coroutine/copy}.c{coroutine/copy}.obj:
-	$(ECHO) compiling $(<:\=/)
-	$(Q) $(CC) $(CFLAGS) $(XCFLAGS) $(CPPFLAGS) $(COUTFLAG)$@ -c $(CSRCFLAG)$(<:\=/)
 
 {$(srcdir)/enc/trans}.c.obj:
 	$(ECHO) compiling $(<:\=/)
@@ -1339,7 +1346,7 @@ $(MJIT_PRECOMPILED_HEADER): $(MJIT_PRECOMPILED_HEADER_NAME)
 	$(Q) $(MAKE_LINK) $(MJIT_PRECOMPILED_HEADER_NAME:.pch=.pdb) $(arch_hdrdir)/$(MJIT_PRECOMPILED_HEADER_NAME:.pch=.pdb)
 
 INSNS	= opt_sc.inc optinsn.inc optunifs.inc insns.inc insns_info.inc \
-	  vmtc.inc vm.inc mjit_compile.inc yjit_hooks.inc
+	  vmtc.inc vm.inc mjit_compile.inc
 
 !if [exit > insns_rules.mk]
 !else if [for %I in ($(INSNS)) do \

@@ -20,7 +20,6 @@ module Bundler
       disable_exec_load
       disable_local_branch_check
       disable_local_revision_check
-      disable_multisource
       disable_shared_gems
       disable_version_check
       force_ruby_platform
@@ -45,7 +44,6 @@ module Bundler
       silence_deprecations
       silence_root_warning
       suppress_install_using_messages
-      unlock_source_unlocks_spec
       update_requires_all_flag
       use_gem_version_promoter_for_major_updates
     ].freeze
@@ -208,6 +206,13 @@ module Bundler
 
       return ["You have not configured a value for `#{exposed_key}`"] if locations.empty?
       locations
+    end
+
+    def processor_count
+      require "etc"
+      Etc.nprocessors
+    rescue StandardError
+      1
     end
 
     # for legacy reasons, in Bundler 2, we do not respect :disable_shared_gems
@@ -414,7 +419,15 @@ module Bundler
       elsif is_credential(key)
         "[REDACTED]"
       elsif is_userinfo(converted)
-        converted.gsub(/:.*$/, ":[REDACTED]")
+        username, pass = converted.split(":", 2)
+
+        if pass == "x-oauth-basic"
+          username = "[REDACTED]"
+        else
+          pass = "[REDACTED]"
+        end
+
+        [username, pass].join(":")
       else
         converted
       end
@@ -423,12 +436,12 @@ module Bundler
     def global_config_file
       if ENV["BUNDLE_CONFIG"] && !ENV["BUNDLE_CONFIG"].empty?
         Pathname.new(ENV["BUNDLE_CONFIG"])
-      else
-        begin
-          Bundler.user_bundle_path("config")
-        rescue PermissionError, GenericSystemCallError
-          nil
-        end
+      elsif ENV["BUNDLE_USER_CONFIG"] && !ENV["BUNDLE_USER_CONFIG"].empty?
+        Pathname.new(ENV["BUNDLE_USER_CONFIG"])
+      elsif ENV["BUNDLE_USER_HOME"] && !ENV["BUNDLE_USER_HOME"].empty?
+        Pathname.new(ENV["BUNDLE_USER_HOME"]).join("config")
+      elsif Bundler.rubygems.user_home && !Bundler.rubygems.user_home.empty?
+        Pathname.new(Bundler.rubygems.user_home).join(".bundle/config")
       end
     end
 
@@ -442,7 +455,20 @@ module Bundler
         valid_file = file.exist? && !file.size.zero?
         return {} unless valid_file
         require_relative "yaml_serializer"
-        YAMLSerializer.load file.read
+        YAMLSerializer.load(file.read).inject({}) do |config, (k, v)|
+          new_k = k
+
+          if k.include?("-")
+            Bundler.ui.warn "Your #{file} config includes `#{k}`, which contains the dash character (`-`).\n" \
+              "This is deprecated, because configuration through `ENV` should be possible, but `ENV` keys cannot include dashes.\n" \
+              "Please edit #{file} and replace any dashes in configuration keys with a triple underscore (`___`)."
+
+            new_k = k.gsub("-", "___")
+          end
+
+          config[new_k] = v
+          config
+        end
       end
     end
 

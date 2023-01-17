@@ -1,5 +1,5 @@
 # frozen_string_literal: true
-require 'rubygems/test_case'
+require_relative 'helper'
 require 'rubygems/request'
 require 'ostruct'
 require 'base64'
@@ -197,27 +197,53 @@ class TestGemRequest < Gem::TestCase
   end
 
   def test_fetch_basic_auth
+    Gem.configuration.verbose = :really
     uri = URI.parse "https://user:pass@example.rubygems/specs.#{Gem.marshal_version}"
     conn = util_stub_net_http(:body => :junk, :code => 200) do |c|
-      @request = make_request(uri, Net::HTTP::Get, nil, nil)
-      @request.fetch
+      use_ui @ui do
+        @request = make_request(uri, Net::HTTP::Get, nil, nil)
+        @request.fetch
+      end
       c
     end
 
     auth_header = conn.payload['Authorization']
     assert_equal "Basic #{Base64.encode64('user:pass')}".strip, auth_header
+    assert_includes @ui.output, "GET https://user:REDACTED@example.rubygems/specs.#{Gem.marshal_version}"
   end
 
   def test_fetch_basic_auth_encoded
+    Gem.configuration.verbose = :really
     uri = URI.parse "https://user:%7BDEScede%7Dpass@example.rubygems/specs.#{Gem.marshal_version}"
+
     conn = util_stub_net_http(:body => :junk, :code => 200) do |c|
-      @request = make_request(uri, Net::HTTP::Get, nil, nil)
-      @request.fetch
+      use_ui @ui do
+        @request = make_request(uri, Net::HTTP::Get, nil, nil)
+        @request.fetch
+      end
       c
     end
 
     auth_header = conn.payload['Authorization']
     assert_equal "Basic #{Base64.encode64('user:{DEScede}pass')}".strip, auth_header
+    assert_includes @ui.output, "GET https://user:REDACTED@example.rubygems/specs.#{Gem.marshal_version}"
+  end
+
+  def test_fetch_basic_oauth_encoded
+    Gem.configuration.verbose = :really
+    uri = URI.parse "https://%7BDEScede%7Dpass:x-oauth-basic@example.rubygems/specs.#{Gem.marshal_version}"
+
+    conn = util_stub_net_http(:body => :junk, :code => 200) do |c|
+      use_ui @ui do
+        @request = make_request(uri, Net::HTTP::Get, nil, nil)
+        @request.fetch
+      end
+      c
+    end
+
+    auth_header = conn.payload['Authorization']
+    assert_equal "Basic #{Base64.encode64('{DEScede}pass:x-oauth-basic')}".strip, auth_header
+    assert_includes @ui.output, "GET https://REDACTED:x-oauth-basic@example.rubygems/specs.#{Gem.marshal_version}"
   end
 
   def test_fetch_head
@@ -327,7 +353,7 @@ class TestGemRequest < Gem::TestCase
   end
 
   def test_verify_certificate
-    skip if Gem.java_platform?
+    pend if Gem.java_platform?
     store = OpenSSL::X509::Store.new
     context = OpenSSL::X509::StoreContext.new store
     context.error = OpenSSL::X509::V_ERR_OUT_OF_MEM
@@ -341,7 +367,7 @@ class TestGemRequest < Gem::TestCase
   end
 
   def test_verify_certificate_extra_message
-    skip if Gem.java_platform?
+    pend if Gem.java_platform?
     store = OpenSSL::X509::Store.new
     context = OpenSSL::X509::StoreContext.new store
     context.error = OpenSSL::X509::V_ERR_INVALID_CA

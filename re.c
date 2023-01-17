@@ -724,8 +724,7 @@ static VALUE
 rb_reg_casefold_p(VALUE re)
 {
     rb_reg_check(re);
-    if (RREGEXP_PTR(re)->options & ONIG_OPTION_IGNORECASE) return Qtrue;
-    return Qfalse;
+    return RBOOL(RREGEXP_PTR(re)->options & ONIG_OPTION_IGNORECASE);
 }
 
 
@@ -1389,10 +1388,7 @@ rb_backref_set_string(VALUE string, long pos, long len)
 static VALUE
 rb_reg_fixed_encoding_p(VALUE re)
 {
-    if (FL_TEST(re, KCODE_FIXED))
-        return Qtrue;
-    else
-        return Qfalse;
+    return RBOOL(FL_TEST(re, KCODE_FIXED));
 }
 
 static VALUE
@@ -3009,7 +3005,7 @@ static st_index_t reg_hash(VALUE re);
  * See also Object#hash.
  */
 
-static VALUE
+VALUE
 rb_reg_hash(VALUE re)
 {
     st_index_t hashval = reg_hash(re);
@@ -3043,7 +3039,7 @@ reg_hash(VALUE re)
  *     /abc/u == /abc/n   #=> false
  */
 
-static VALUE
+VALUE
 rb_reg_equal(VALUE re1, VALUE re2)
 {
     if (re1 == re2) return Qtrue;
@@ -3228,7 +3224,7 @@ rb_reg_match(VALUE re, VALUE str)
  *	/^[A-Z]*$/ === "HELLO" #=> true
  */
 
-VALUE
+static VALUE
 rb_reg_eqq(VALUE re, VALUE str)
 {
     long start;
@@ -3337,10 +3333,10 @@ rb_reg_match_m(int argc, VALUE *argv, VALUE re)
 
 /*
  *  call-seq:
- *     rxp.match?(str)       -> true or false
- *     rxp.match?(str,pos)   -> true or false
+ *     rxp.match?(str)          -> true or false
+ *     rxp.match?(str, pos=0)   -> true or false
  *
- *  Returns a <code>true</code> or <code>false</code> indicates whether the
+ *  Returns <code>true</code> or <code>false</code> to indicate whether the
  *  regexp is matched or not without updating $~ and other related variables.
  *  If the second parameter is present, it specifies the position in the string
  *  to begin the search.
@@ -3610,7 +3606,7 @@ rb_reg_options(VALUE re)
     return options;
 }
 
-VALUE
+static VALUE
 rb_check_regexp_type(VALUE re)
 {
     return rb_check_convert_type(re, T_REGEXP, "Regexp", "to_regexp");

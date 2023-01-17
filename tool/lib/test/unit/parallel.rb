@@ -6,7 +6,7 @@ require "profile_test_all" if ENV.key?('RUBY_TEST_ALL_PROFILE')
 require "tracepointchecker"
 require "zombie_hunter"
 require "iseq_loader_checker"
-require "gc_compact_checker"
+require "gc_checker"
 
 module Test
   module Unit
@@ -52,7 +52,7 @@ module Test
         # Thread for making sure the parallel worker is not stuck on one test
         # for too long.
         @timer_thread = Thread.new do
-          timeout = 8 * 60 # 8 minutes
+          timeout = 12 * 60 # 12 minutes
           while true
             slept_for = sleep(timeout)
             if slept_for >= timeout

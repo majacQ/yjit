@@ -1,15 +1,14 @@
 #ifndef YJIT_CORE_H
 #define YJIT_CORE_H 1
 
-#include "stddef.h"
+#include <stddef.h>
+#include <stdint.h>
 #include "yjit_asm.h"
 
-// Register YJIT receives the CFP and EC into
-#define REG_CFP RDI
-#define REG_EC RSI
-
-// Register YJIT loads the SP into
-#define REG_SP RDX
+// Callee-saved regs
+#define REG_CFP R13
+#define REG_EC R12
+#define REG_SP RBX
 
 // Scratch registers used by YJIT
 #define REG0 RAX
@@ -32,7 +31,10 @@ enum yjit_type_enum
 {
     ETYPE_UNKNOWN = 0,
     ETYPE_NIL,
+    ETYPE_TRUE,
+    ETYPE_FALSE,
     ETYPE_FIXNUM,
+    ETYPE_FLONUM,
     ETYPE_ARRAY,
     ETYPE_HASH,
     ETYPE_SYMBOL,
@@ -49,7 +51,7 @@ typedef struct yjit_type_struct
     uint8_t is_imm : 1;
 
     // Specific value type, if known
-    uint8_t type : 3;
+    uint8_t type : 4;
 
 } val_type_t;
 STATIC_ASSERT(val_type_size, sizeof(val_type_t) == 1);
@@ -64,9 +66,14 @@ STATIC_ASSERT(val_type_size, sizeof(val_type_t) == 1);
 #define TYPE_IMM ( (val_type_t){ .is_imm = 1 } )
 
 #define TYPE_NIL ( (val_type_t){ .is_imm = 1, .type = ETYPE_NIL } )
+#define TYPE_TRUE ( (val_type_t){ .is_imm = 1, .type = ETYPE_TRUE } )
+#define TYPE_FALSE ( (val_type_t){ .is_imm = 1, .type = ETYPE_FALSE } )
 #define TYPE_FIXNUM ( (val_type_t){ .is_imm = 1, .type = ETYPE_FIXNUM } )
+#define TYPE_FLONUM ( (val_type_t){ .is_imm = 1, .type = ETYPE_FLONUM } )
+#define TYPE_STATIC_SYMBOL ( (val_type_t){ .is_imm = 1, .type = ETYPE_SYMBOL } )
 #define TYPE_ARRAY ( (val_type_t){ .is_heap = 1, .type = ETYPE_ARRAY } )
 #define TYPE_HASH ( (val_type_t){ .is_heap = 1, .type = ETYPE_HASH } )
+#define TYPE_STRING ( (val_type_t){ .is_heap = 1, .type = ETYPE_STRING } )
 
 enum yjit_temp_loc
 {
@@ -95,6 +102,13 @@ STATIC_ASSERT(temp_mapping_size, sizeof(temp_mapping_t) == 1);
 
 // Temp value is actually self
 #define MAP_SELF ( (temp_mapping_t) { .kind = TEMP_SELF } )
+
+// Represents both the type and mapping
+typedef struct {
+    temp_mapping_t mapping;
+    val_type_t type;
+} temp_type_mapping_t;
+STATIC_ASSERT(temp_type_mapping_size, sizeof(temp_type_mapping_t) == 2);
 
 // Operand to a bytecode instruction
 typedef struct yjit_insn_opnd
@@ -176,8 +190,8 @@ typedef struct yjit_branch_entry
     struct yjit_block_version *block;
 
     // Positions where the generated code starts and ends
-    uint32_t start_pos;
-    uint32_t end_pos;
+    uint8_t* start_pos;
+    uint8_t* end_pos;
 
     // Context right after the branch instruction
     ctx_t src_ctx;
@@ -198,9 +212,18 @@ typedef struct yjit_branch_entry
 
 } branch_t;
 
+// In case this block is invalidated, these two pieces of info
+// help to remove all pointers to this block in the system.
+typedef struct {
+    VALUE receiver_klass;
+    VALUE callee_cme;
+} cme_dependency_t;
+
+typedef rb_darray(cme_dependency_t) cme_dependency_array_t;
+
 typedef rb_darray(branch_t*) branch_array_t;
 
-typedef rb_darray(uint32_t) int32_array_t;
+typedef rb_darray(uint8_t*) code_ptr_array_t;
 
 /**
 Basic block version
@@ -216,8 +239,8 @@ typedef struct yjit_block_version
     ctx_t ctx;
 
     // Positions where the generated code starts and ends
-    uint32_t start_pos;
-    uint32_t end_pos;
+    uint8_t* start_pos;
+    uint8_t* end_pos;
 
     // List of incoming branches (from predecessors)
     branch_array_t incoming;
@@ -226,38 +249,50 @@ typedef struct yjit_block_version
     // Note: these are owned by this block version
     branch_array_t outgoing;
 
-    // Offsets for GC managed objects in the mainline code block
-    int32_array_t gc_object_offsets;
+    // Pointers to GC managed objects in the inline code block
+    code_ptr_array_t gc_object_offsets;
 
-    // In case this block is invalidated, these two pieces of info
-    // help to remove all pointers to this block in the system.
-    VALUE receiver_klass;
-    VALUE callee_cme;
+    // CME dependencies of this block, to help to remove all pointers to this
+    // block in the system.
+    cme_dependency_array_t cme_dependencies;
+
+    // Wrapper object
+    VALUE self;
 
     // Index one past the last instruction in the iseq
     uint32_t end_idx;
+
 } block_t;
 
 // Context object methods
 x86opnd_t ctx_sp_opnd(ctx_t* ctx, int32_t offset_bytes);
+x86opnd_t ctx_stack_push_mapping(ctx_t* ctx, temp_type_mapping_t mapping);
 x86opnd_t ctx_stack_push(ctx_t* ctx, val_type_t type);
 x86opnd_t ctx_stack_push_self(ctx_t* ctx);
 x86opnd_t ctx_stack_push_local(ctx_t* ctx, size_t local_idx);
 x86opnd_t ctx_stack_pop(ctx_t* ctx, size_t n);
 x86opnd_t ctx_stack_opnd(ctx_t* ctx, int32_t idx);
 val_type_t ctx_get_opnd_type(const ctx_t* ctx, insn_opnd_t opnd);
-void ctx_set_opnd_type(ctx_t* ctx, insn_opnd_t opnd, val_type_t type);
+void ctx_upgrade_opnd_type(ctx_t* ctx, insn_opnd_t opnd, val_type_t type);
 void ctx_set_local_type(ctx_t* ctx, size_t idx, val_type_t type);
 void ctx_clear_local_types(ctx_t* ctx);
 int ctx_diff(const ctx_t* src, const ctx_t* dst);
+int type_diff(val_type_t src, val_type_t dst);
+val_type_t yjit_type_of_value(VALUE val);
+const char *yjit_type_name(val_type_t type);
+
+temp_type_mapping_t ctx_get_opnd_mapping(const ctx_t* ctx, insn_opnd_t opnd);
+void ctx_set_opnd_mapping(ctx_t* ctx, insn_opnd_t opnd, temp_type_mapping_t type_mapping);
 
 block_t* find_block_version(blockid_t blockid, const ctx_t* ctx);
 block_t* gen_block_version(blockid_t blockid, const ctx_t* ctx, rb_execution_context_t *ec);
-uint8_t*  gen_entry_point(const rb_iseq_t *iseq, uint32_t insn_idx, rb_execution_context_t *ec);
+uint8_t* gen_entry_point(const rb_iseq_t *iseq, uint32_t insn_idx, rb_execution_context_t *ec);
 void yjit_free_block(block_t *block);
 rb_yjit_block_array_t yjit_get_version_array(const rb_iseq_t *iseq, unsigned idx);
 
 void gen_branch(
+    codeblock_t* cb,
+    codeblock_t* ocb,
     block_t* block,
     const ctx_t* src_ctx,
     blockid_t target0,
@@ -268,12 +303,15 @@ void gen_branch(
 );
 
 void gen_direct_jump(
+    codeblock_t* cb,
     block_t* block,
     const ctx_t* ctx,
     blockid_t target0
 );
 
 void defer_compilation(
+    codeblock_t* cb,
+    codeblock_t* ocb,
     block_t* block,
     uint32_t insn_idx,
     ctx_t* cur_ctx

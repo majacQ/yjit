@@ -5,6 +5,12 @@
 #include <stddef.h>
 #include <stdbool.h>
 
+// Size of code pages to allocate
+#define CODE_PAGE_SIZE 16 * 1024
+
+// How many code pages to allocate at once
+#define PAGES_PER_ALLOC 512
+
 // Maximum number of labels to link
 #define MAX_LABELS 32
 
@@ -131,6 +137,20 @@ typedef struct X86Opnd
 
 } x86opnd_t;
 
+// Struct representing a code page
+typedef struct code_page_struct
+{
+    // Chunk of executable memory
+    uint8_t* mem_block;
+
+    // Size of the executable memory chunk
+    uint32_t page_size;
+
+    // Next node in the free list (private)
+    struct code_page_struct* _next;
+
+} code_page_t;
+
 // Dummy none/null operand
 static const x86opnd_t NO_OPND = { OPND_NONE, 0, .as.imm = 0 };
 
@@ -213,6 +233,10 @@ static const x86opnd_t R15B = { OPND_REG, 8, .as.reg = { REG_GP, 15 }};
 #define NUM_C_ARG_REGS 6
 #define C_ARG_REGS ( (x86opnd_t[]){ RDI, RSI, RDX, RCX, R8, R9 } )
 
+// Compute the number of bits needed to store a signed or unsigned value
+uint32_t sig_imm_size(int64_t imm);
+uint32_t unsig_imm_size(uint64_t imm);
+
 // Memory operand with base register and displacement/offset
 x86opnd_t mem_opnd(uint32_t num_bits, x86opnd_t base_reg, int32_t disp);
 
@@ -240,12 +264,18 @@ x86opnd_t const_ptr_opnd(const void *ptr);
      sizeof(((struct_type*)0)->member_name[0]) * idx)  \
 )
 
-// Code block methods
+// Machine code allocation
 uint8_t* alloc_exec_mem(uint32_t mem_size);
+code_page_t* alloc_code_page(void);
+void free_code_page(code_page_t* code_page);
+
+// Code block methods
 void cb_init(codeblock_t* cb, uint8_t* mem_block, uint32_t mem_size);
 void cb_align_pos(codeblock_t* cb, uint32_t multiple);
 void cb_set_pos(codeblock_t* cb, uint32_t pos);
+void cb_set_write_ptr(codeblock_t* cb, uint8_t* code_ptr);
 uint8_t* cb_get_ptr(codeblock_t* cb, uint32_t index);
+uint8_t* cb_get_write_ptr(codeblock_t* cb);
 void cb_write_byte(codeblock_t* cb, uint8_t byte);
 void cb_write_bytes(codeblock_t* cb, uint32_t num_bytes, ...);
 void cb_write_int(codeblock_t* cb, uint64_t val, uint32_t num_bits);
@@ -380,5 +410,6 @@ void ud2(codeblock_t* cb);
 void xchg(codeblock_t* cb, x86opnd_t rm_opnd, x86opnd_t r_opnd);
 void xor(codeblock_t* cb, x86opnd_t opnd0, x86opnd_t opnd1);
 void cb_write_lock_prefix(codeblock_t* cb);
+void cb_load_label_address(codeblock_t* cb, x86opnd_t reg, uint32_t label_idx);
 
 #endif

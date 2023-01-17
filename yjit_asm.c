@@ -7,6 +7,7 @@
 #include <stdarg.h>
 #include <stdint.h>
 #include <assert.h>
+#include <errno.h>
 
 // For mmapp(), sysconf()
 #ifndef _WIN32
@@ -203,7 +204,7 @@ uint8_t* alloc_exec_mem(uint32_t mem_size)
 
     // Check that the memory mapping was successful
     if (mem_block == MAP_FAILED) {
-        fprintf(stderr, "mmap call failed\n");
+        perror("mmap call failed");
         exit(-1);
     }
 
@@ -218,9 +219,45 @@ uint8_t* alloc_exec_mem(uint32_t mem_size)
 #endif
 }
 
+// Head of the list of free code pages
+code_page_t *freelist = NULL;
+
+// Allocate a single code page from a pool of free pages
+code_page_t* alloc_code_page()
+{
+    // If the free list is empty
+    if (!freelist) {
+        // Allocate many pages at once
+        uint8_t* code_chunk = alloc_exec_mem(PAGES_PER_ALLOC * CODE_PAGE_SIZE);
+
+        // Do this in reverse order so we allocate our pages in order
+        for (int i = PAGES_PER_ALLOC - 1; i >= 0; --i) {
+            code_page_t* code_page = malloc(sizeof(code_page_t));
+            code_page->mem_block = code_chunk + i * CODE_PAGE_SIZE;
+            assert ((intptr_t)code_page->mem_block % CODE_PAGE_SIZE == 0);
+            code_page->page_size = CODE_PAGE_SIZE;
+            code_page->_next = freelist;
+            freelist = code_page;
+        }
+    }
+
+    code_page_t* free_page = freelist;
+    freelist = freelist->_next;
+
+    return free_page;
+}
+
+// Put a code page back into the allocation pool
+void free_code_page(code_page_t* code_page)
+{
+    code_page->_next = freelist;
+    freelist = code_page;
+}
+
 // Initialize a code block object
 void cb_init(codeblock_t* cb, uint8_t* mem_block, uint32_t mem_size)
 {
+    assert (mem_block);
     cb->mem_block = mem_block;
     cb->mem_size = mem_size;
     cb->write_pos = 0;
@@ -247,11 +284,25 @@ void cb_set_pos(codeblock_t* cb, uint32_t pos)
     cb->write_pos = pos;
 }
 
+// Set the current write position from a pointer
+void cb_set_write_ptr(codeblock_t* cb, uint8_t* code_ptr)
+{
+    intptr_t pos = code_ptr - cb->mem_block;
+    assert (pos < cb->mem_size);
+    cb->write_pos = (uint32_t)pos;
+}
+
 // Get a direct pointer into the executable memory block
 uint8_t* cb_get_ptr(codeblock_t* cb, uint32_t index)
 {
     assert (index < cb->mem_size);
     return &cb->mem_block[index];
+}
+
+// Get a direct pointer to the current write position
+uint8_t* cb_get_write_ptr(codeblock_t* cb)
+{
+    return cb_get_ptr(cb, cb->write_pos);
 }
 
 // Write a byte at the current position
@@ -1724,8 +1775,34 @@ void xor(codeblock_t* cb, x86opnd_t opnd0, x86opnd_t opnd1)
     );
 }
 
-// LOCK - lock prefix for atomic shared memory operations
+/// LOCK - lock prefix for atomic shared memory operations
 void cb_write_lock_prefix(codeblock_t* cb)
 {
     cb_write_byte(cb, 0xF0);
+}
+
+/// RIP relative LEA to put the address of a label into a register
+void cb_load_label_address(codeblock_t* cb, x86opnd_t reg, uint32_t label_idx)
+{
+    assert(reg.num_bits == 64);
+    assert(reg.type == OPND_REG);
+
+    uint8_t reg_no = reg.as.reg.reg_no;
+
+    assert(reg_no < 16);
+
+    // 64 bit LEA wants REX.W
+    cb_write_rex(cb, true, reg_no, 0, 0);
+    // opcode
+    cb_write_byte(cb, 0x8D);
+    // MODRM.mod = 0b00  from the manual
+    // MODRM.reg = given register
+    // MODRM.rm  = 0b101 from the manual
+    cb_write_byte(cb, 0x5 + ((reg_no & 7) << 3));
+
+    // Add a reference to the label
+    cb_label_ref(cb, label_idx);
+
+    // Relative 32-bit offset to be patched
+    cb_write_int(cb, 0, 32);
 }

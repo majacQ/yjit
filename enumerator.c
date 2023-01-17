@@ -2700,8 +2700,14 @@ lazy_with_index_proc(VALUE proc_entry, struct MEMO* result, VALUE memos, long me
     return result;
 }
 
+static VALUE
+lazy_with_index_size(VALUE proc, VALUE receiver)
+{
+    return receiver;
+}
+
 static const lazyenum_funcs lazy_with_index_funcs = {
-    lazy_with_index_proc, 0,
+    lazy_with_index_proc, lazy_with_index_size,
 };
 
 /*
@@ -3139,7 +3145,8 @@ enum_chain_initialize(VALUE obj, VALUE enums)
 }
 
 static VALUE
-new_enum_chain(VALUE enums) {
+new_enum_chain(VALUE enums)
+{
     long i;
     VALUE obj = enum_chain_initialize(enum_chain_allocate(rb_cEnumChain), enums);
 
@@ -3362,7 +3369,7 @@ rb_arith_seq_new(VALUE obj, VALUE meth, int argc, VALUE const *argv,
     rb_ivar_set(aseq, id_begin, beg);
     rb_ivar_set(aseq, id_end, end);
     rb_ivar_set(aseq, id_step, step);
-    rb_ivar_set(aseq, id_exclude_end, excl ? Qtrue : Qfalse);
+    rb_ivar_set(aseq, id_exclude_end, RBOOL(excl));
     return aseq;
 }
 

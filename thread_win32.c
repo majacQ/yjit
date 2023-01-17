@@ -129,13 +129,13 @@ gvl_destroy(rb_global_vm_lock_t *gvl)
     CloseHandle(gvl->lock);
 }
 
-static rb_thread_t *
+rb_thread_t *
 ruby_thread_from_native(void)
 {
     return TlsGetValue(ruby_native_thread_key);
 }
 
-static int
+int
 ruby_thread_set_native(rb_thread_t *th)
 {
     if (th && th->ec) {
@@ -834,6 +834,15 @@ static void
 native_set_thread_name(rb_thread_t *th)
 {
 }
+
+static VALUE
+native_thread_native_thread_id(rb_thread_t *th)
+{
+    DWORD tid = GetThreadId(th->thread_id);
+    if (tid == 0) rb_sys_fail("GetThreadId");
+    return ULONG2NUM(tid);
+}
+#define USE_NATIVE_THREAD_NATIVE_THREAD_ID 1
 
 #if USE_MJIT
 static unsigned long __stdcall

@@ -14,6 +14,7 @@ module Bundler
     COMMAND_ALIASES = {
       "check" => "c",
       "install" => "i",
+      "plugin" => "",
       "list" => "ls",
       "exec" => ["e", "ex", "exe"],
       "cache" => ["package", "pack"],
@@ -72,14 +73,6 @@ module Bundler
       Bundler.ui = UI::Shell.new(options)
       Bundler.ui.level = "debug" if options["verbose"]
       unprinted_warnings.each {|w| Bundler.ui.warn(w) }
-
-      if ENV["RUBYGEMS_GEMDEPS"] && !ENV["RUBYGEMS_GEMDEPS"].empty?
-        Bundler.ui.warn(
-          "The RUBYGEMS_GEMDEPS environment variable is set. This enables RubyGems' " \
-          "experimental Gemfile mode, which may conflict with Bundler and cause unexpected errors. " \
-          "To remove this warning, unset RUBYGEMS_GEMDEPS.", :wrap => true
-        )
-      end
     end
 
     check_unknown_options!(:except => [:config, :exec])
@@ -308,39 +301,19 @@ module Bundler
       end
     end
 
-    unless Bundler.feature_flag.bundler_3_mode?
-      desc "show GEM [OPTIONS]", "Shows all gems that are part of the bundle, or the path to a given gem"
-      long_desc <<-D
-        Show lists the names and versions of all gems that are required by your Gemfile.
-        Calling show with [GEM] will list the exact location of that gem on your machine.
-      D
-      method_option "paths", :type => :boolean,
-                             :banner => "List the paths of all gems that are required by your Gemfile."
-      method_option "outdated", :type => :boolean,
-                                :banner => "Show verbose output including whether gems are outdated."
-      def show(gem_name = nil)
-        if ARGV[0] == "show"
-          rest = ARGV[1..-1]
-
-          if flag = rest.find{|arg| ["--verbose", "--outdated"].include?(arg) }
-            Bundler::SharedHelpers.major_deprecation(2, "the `#{flag}` flag to `bundle show` was undocumented and will be removed without replacement")
-          else
-            new_command = rest.find {|arg| !arg.start_with?("--") } ? "info" : "list"
-
-            new_arguments = rest.map do |arg|
-              next arg if arg != "--paths"
-              next "--path" if new_command == "info"
-            end
-
-            old_argv = ARGV.join(" ")
-            new_argv = [new_command, *new_arguments.compact].join(" ")
-
-            Bundler::SharedHelpers.major_deprecation(2, "use `bundle #{new_argv}` instead of `bundle #{old_argv}`")
-          end
-        end
-        require_relative "cli/show"
-        Show.new(options, gem_name).run
-      end
+    desc "show GEM [OPTIONS]", "Shows all gems that are part of the bundle, or the path to a given gem"
+    long_desc <<-D
+      Show lists the names and versions of all gems that are required by your Gemfile.
+      Calling show with [GEM] will list the exact location of that gem on your machine.
+    D
+    method_option "paths", :type => :boolean,
+                           :banner => "List the paths of all gems that are required by your Gemfile."
+    method_option "outdated", :type => :boolean,
+                              :banner => "Show verbose output including whether gems are outdated."
+    def show(gem_name = nil)
+      SharedHelpers.major_deprecation(2, "the `--outdated` flag to `bundle show` was undocumented and will be removed without replacement") if ARGV.include?("--outdated")
+      require_relative "cli/show"
+      Show.new(options, gem_name).run
     end
 
     desc "list", "List all gems in the bundle"
@@ -488,7 +461,7 @@ module Bundler
     map aliases_for("cache")
 
     desc "exec [OPTIONS]", "Run the command in context of the bundle"
-    method_option :keep_file_descriptors, :type => :boolean, :default => false
+    method_option :keep_file_descriptors, :type => :boolean, :default => true
     method_option :gemfile, :type => :string, :required => false
     long_desc <<-D
       Exec runs a command, providing it access to the gems in the bundle. While using
@@ -496,6 +469,10 @@ module Bundler
       into the system wide RubyGems repository.
     D
     def exec(*args)
+      if ARGV.include?("--no-keep-file-descriptors")
+        SharedHelpers.major_deprecation(2, "The `--no-keep-file-descriptors` has been deprecated. `bundle exec` no longer mess with your file descriptors. Close them in the exec'd script if you need to")
+      end
+
       require_relative "cli/exec"
       Exec.new(options, args).run
     end

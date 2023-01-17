@@ -1,3 +1,148 @@
+# Check that frozen objects are respected
+assert_equal 'great', %q{
+  class Foo
+    attr_accessor :bar
+    def initialize
+      @bar = 1
+      freeze
+    end
+  end
+
+  foo = Foo.new
+
+  5.times do
+    begin
+      foo.bar = 2
+    rescue FrozenError
+    end
+  end
+
+  foo.bar == 1 ? "great" : "NG"
+}
+
+# Check that global variable set works
+assert_equal 'string', %q{
+  def foo
+    $foo = "string"
+  end
+
+  foo
+}
+
+# Check that exceptions work when setting global variables
+assert_equal 'rescued', %q{
+  def set_var
+    $var = 100
+  rescue
+    :rescued
+  end
+
+  set_var
+  trace_var(:$var) { raise }
+  set_var
+}
+
+# Check that global variables work
+assert_equal 'string', %q{
+  $foo = "string"
+
+  def foo
+    $foo
+  end
+
+  foo
+}
+
+# Check that exceptions work when getting global variable
+assert_equal 'rescued', %q{
+  module Warning
+    def warn(message)
+      raise
+    end
+  end
+
+  def get_var
+    $=
+  rescue
+    :rescued
+  end
+
+  $VERBOSE = true
+  get_var
+  get_var
+}
+
+# Check that global tracepoints work
+assert_equal 'true', %q{
+  def foo
+    1
+  end
+
+  foo
+  foo
+  foo
+
+  called = false
+
+  tp = TracePoint.new(:return) { |event|
+    if event.method_id == :foo
+      called = true
+    end
+  }
+  tp.enable
+  foo
+  tp.disable
+  called
+}
+
+# Check that local tracepoints work
+assert_equal 'true', %q{
+  def foo
+    1
+  end
+
+  foo
+  foo
+  foo
+
+  called = false
+
+  tp = TracePoint.new(:return) { |_| called = true }
+  tp.enable(target: method(:foo))
+  foo
+  tp.disable
+  called
+}
+
+# Make sure that optional param methods return the correct value
+assert_equal '1', %q{
+  def m(ary = [])
+    yield(ary)
+  end
+
+  # Warm the JIT with a 0 param call
+  2.times { m { } }
+  m(1) { |v| v }
+}
+
+# Test for topn
+assert_equal 'array', %q{
+  def threequals(a)
+    case a
+    when Array
+      "array"
+    when Hash
+      "hash"
+    else
+      "unknown"
+    end
+  end
+
+  threequals([])
+  threequals([])
+  threequals([])
+}
+
 # Test for opt_mod
 assert_equal '2', %q{
   def mod(a, b)
@@ -6,6 +151,26 @@ assert_equal '2', %q{
 
   mod(7, 5)
   mod(7, 5)
+}
+
+# Test for opt_mult
+assert_equal '12', %q{
+  def mult(a, b)
+    a * b
+  end
+
+  mult(6, 2)
+  mult(6, 2)
+}
+
+# Test for opt_div
+assert_equal '3', %q{
+  def div(a, b)
+    a / b
+  end
+
+  div(6, 2)
+  div(6, 2)
 }
 
 # BOP redefined methods work when JIT compiled
@@ -296,6 +461,29 @@ assert_equal '7', %q{
 
     foo(4)
     foo(4)[1]
+}
+
+# Method redefinition while the method is on the stack
+assert_equal '[777, 1]', %q{
+    def foo
+        redef()
+        777
+    end
+
+    def redef
+        # Redefine the global foo
+        eval("def foo; 1; end", TOPLEVEL_BINDING)
+
+        # Collect dead code
+        GC.stress = true
+        GC.start
+
+        # But we will return to the original foo,
+        # which remains alive because it's on the stack
+    end
+
+    # Must produce [777, 1]
+    [foo, foo]
 }
 
 # Test for GC safety. Don't invalidate dead iseqs.
@@ -926,4 +1114,907 @@ assert_equal '[Proc, 1, 2, 3, Proc]', %q{
   use_zero
 
   [use_zero] + use_three
+}
+
+# test building empty array
+assert_equal '[]', %q{
+  def build_arr
+    []
+  end
+
+  build_arr
+  build_arr
+}
+
+# test building array of one element
+assert_equal '[5]', %q{
+  def build_arr(val)
+    [val]
+  end
+
+  build_arr(5)
+  build_arr(5)
+}
+
+# test building array of several element
+assert_equal '[5, 5, 5, 5, 5]', %q{
+  def build_arr(val)
+    [val, val, val, val, val]
+  end
+
+  build_arr(5)
+  build_arr(5)
+}
+
+# test building empty hash
+assert_equal '{}', %q{
+  def build_hash
+    {}
+  end
+
+  build_hash
+  build_hash
+}
+
+# test building hash with values
+assert_equal '{:foo=>:bar}', %q{
+  def build_hash(val)
+    { foo: val }
+  end
+
+  build_hash(:bar)
+  build_hash(:bar)
+}
+
+# test string interpolation with known types
+assert_equal 'foobar', %q{
+  def make_str
+    foo = -"foo"
+    bar = -"bar"
+    "#{foo}#{bar}"
+  end
+
+  make_str
+  make_str
+}
+
+# test string interpolation with unknown types
+assert_equal 'foobar', %q{
+  def make_str(foo, bar)
+    "#{foo}#{bar}"
+  end
+
+  make_str("foo", "bar")
+  make_str("foo", "bar")
+}
+
+# test string interpolation with known non-strings
+assert_equal 'foo123', %q{
+  def make_str
+    foo = -"foo"
+    bar = 123
+    "#{foo}#{bar}"
+  end
+
+  make_str
+  make_str
+}
+
+# test string interpolation with unknown non-strings
+assert_equal 'foo123', %q{
+  def make_str(foo, bar)
+    "#{foo}#{bar}"
+  end
+
+  make_str("foo", 123)
+  make_str("foo", 123)
+}
+
+# test invokebuiltin as used in struct assignment
+assert_equal '123', %q{
+  def foo(obj)
+    obj.foo = 123
+  end
+
+  struct = Struct.new(:foo)
+  obj = struct.new
+  foo(obj)
+  foo(obj)
+}
+
+# test invokebuiltin_delegate as used inside Dir.open
+assert_equal '.', %q{
+  def foo(path)
+    Dir.open(path).path
+  end
+
+  foo(".")
+  foo(".")
+}
+
+# test invokebuiltin_delegate_leave in method called from jit
+assert_normal_exit %q{
+  def foo(obj)
+    obj.clone
+  end
+
+  foo(Object.new)
+  foo(Object.new)
+}
+
+# test invokebuiltin_delegate_leave in method called from cfunc
+assert_normal_exit %q{
+  def foo(obj)
+    [obj].map(&:clone)
+  end
+
+  foo(Object.new)
+  foo(Object.new)
+}
+
+# defining TrueClass#!
+assert_equal '[false, false, :ok]', %q{
+  def foo(obj)
+    !obj
+  end
+
+  x = foo(true)
+  y = foo(true)
+
+  class TrueClass
+    def !
+      :ok
+    end
+  end
+
+  z = foo(true)
+
+  [x, y, z]
+}
+
+# defining FalseClass#!
+assert_equal '[true, true, :ok]', %q{
+  def foo(obj)
+    !obj
+  end
+
+  x = foo(false)
+  y = foo(false)
+
+  class FalseClass
+    def !
+      :ok
+    end
+  end
+
+  z = foo(false)
+
+  [x, y, z]
+}
+
+# defining NilClass#!
+assert_equal '[true, true, :ok]', %q{
+  def foo(obj)
+    !obj
+  end
+
+  x = foo(nil)
+  y = foo(nil)
+
+  class NilClass
+    def !
+      :ok
+    end
+  end
+
+  z = foo(nil)
+
+  [x, y, z]
+}
+
+# polymorphic opt_not
+assert_equal '[true, true, false, false, false, false, false]', %q{
+  def foo(obj)
+    !obj
+  end
+
+  foo(0)
+  [foo(nil), foo(false), foo(true), foo([]), foo(0), foo(4.2), foo(:sym)]
+}
+
+# getlocal with 2 levels
+assert_equal '7', %q{
+  def foo(foo, bar)
+    while foo > 0
+      while bar > 0
+        return foo + bar
+      end
+    end
+  end
+
+  foo(5,2)
+  foo(5,2)
+}
+
+# test pattern matching
+assert_equal '[:ok, :ok]', %q{
+  class C
+    def destructure_keys
+      {}
+    end
+  end
+
+  pattern_match = ->(i) do
+    case i
+    in a: 0
+      :ng
+    else
+      :ok
+    end
+  end
+
+  [{}, C.new].map(&pattern_match)
+}
+
+# Call to object with singleton
+assert_equal '123', %q{
+  obj = Object.new
+  def obj.foo
+    123
+  end
+
+  def foo(obj)
+    obj.foo()
+  end
+
+  foo(obj)
+  foo(obj)
+}
+
+# Call method on an object that has a non-material
+# singleton class.
+# TODO: assert that it takes no side exits? This
+# test case revealed that we were taking exits unnecessarily.
+assert_normal_exit %q{
+  def foo(obj)
+    obj.itself
+  end
+
+  o = Object.new.singleton_class
+  foo(o)
+  foo(o)
+}
+
+# Call to singleton class
+assert_equal '123', %q{
+  class Foo
+    def self.foo
+      123
+    end
+  end
+
+  def foo(obj)
+    obj.foo()
+  end
+
+  foo(Foo)
+  foo(Foo)
+}
+
+# invokesuper edge case
+assert_equal '[:A, [:A, :B]]', %q{
+  class B
+    def foo = :B
+  end
+
+  class A < B
+    def foo = [:A, super()]
+  end
+
+  A.new.foo
+  A.new.foo # compile A#foo
+
+  class C < A
+    define_method(:bar, A.instance_method(:foo))
+  end
+
+  C.new.bar
+}
+
+# Same invokesuper bytecode, multiple destinations
+assert_equal '[:Forward, :SecondTerminus]', %q{
+  module Terminus
+    def foo = :Terminus
+  end
+
+  module SecondTerminus
+    def foo = :SecondTerminus
+  end
+
+
+  module Forward
+    def foo = [:Forward, super]
+  end
+
+  class B
+    include SecondTerminus
+  end
+
+  class A < B
+    include Terminus
+    include Forward
+  end
+
+  A.new.foo
+  A.new.foo # compile
+
+  class B
+    include Forward
+    alias bar foo
+  end
+
+  # A.ancestors.take(5) == [A, Forward, Terminus, B, Forward, SecondTerminus]
+
+  A.new.bar
+}
+
+# invokesuper calling into itself
+assert_equal '[:B, [:B, :m]]', %q{
+  module M
+    def foo = :m
+  end
+
+  class B
+    include M
+    def foo = [:B, super]
+  end
+
+  ins = B.new
+  ins.singleton_class # materialize the singleton class
+  ins.foo
+  ins.foo # compile
+
+  ins.singleton_class.define_method(:bar, B.instance_method(:foo))
+  ins.bar
+}
+
+# invokesuper changed ancestor
+assert_equal '[:A, [:M, :B]]', %q{
+  class B
+    def foo
+      :B
+    end
+  end
+
+  class A < B
+    def foo
+      [:A, super]
+    end
+  end
+
+  module M
+    def foo
+      [:M, super]
+    end
+  end
+
+  ins = A.new
+  ins.foo
+  ins.foo
+  A.include(M)
+  ins.foo
+}
+
+# invokesuper changed ancestor via prepend
+assert_equal '[:A, [:M, :B]]', %q{
+  class B
+    def foo
+      :B
+    end
+  end
+
+  class A < B
+    def foo
+      [:A, super]
+    end
+  end
+
+  module M
+    def foo
+      [:M, super]
+    end
+  end
+
+  ins = A.new
+  ins.foo
+  ins.foo
+  B.prepend(M)
+  ins.foo
+}
+
+# invokesuper replaced method
+assert_equal '[:A, :Btwo]', %q{
+  class B
+    def foo
+      :B
+    end
+  end
+
+  class A < B
+    def foo
+      [:A, super]
+    end
+  end
+
+  ins = A.new
+  ins.foo
+  ins.foo
+  class B
+    def foo
+      :Btwo
+    end
+  end
+  ins.foo
+}
+
+# Call to fixnum
+assert_equal '[true, false]', %q{
+  def is_odd(obj)
+    obj.odd?
+  end
+
+  is_odd(1)
+  is_odd(1)
+
+  [is_odd(123), is_odd(456)]
+}
+
+# Call to bignum
+assert_equal '[true, false]', %q{
+  def is_odd(obj)
+    obj.odd?
+  end
+
+  bignum = 99999999999999999999
+  is_odd(bignum)
+  is_odd(bignum)
+
+  [is_odd(bignum), is_odd(bignum+1)]
+}
+
+# Call to fixnum and bignum
+assert_equal '[true, false, true, false]', %q{
+  def is_odd(obj)
+    obj.odd?
+  end
+
+  bignum = 99999999999999999999
+  is_odd(bignum)
+  is_odd(bignum)
+  is_odd(123)
+  is_odd(123)
+
+  [is_odd(123), is_odd(456), is_odd(bignum), is_odd(bignum+1)]
+}
+
+# Call to static and dynamic symbol
+assert_equal 'bar', %q{
+  def to_string(obj)
+    obj.to_s
+  end
+
+  to_string(:foo)
+  to_string(:foo)
+  to_string((-"bar").to_sym)
+  to_string((-"bar").to_sym)
+}
+
+# Call to flonum and heap float
+assert_equal '[nil, nil, nil, 1]', %q{
+  def is_inf(obj)
+    obj.infinite?
+  end
+
+  is_inf(0.0)
+  is_inf(0.0)
+  is_inf(1e256)
+  is_inf(1e256)
+
+  [
+    is_inf(0.0),
+    is_inf(1.0),
+    is_inf(1e256),
+    is_inf(1.0/0.0)
+  ]
+}
+
+assert_equal '[1, 2, 3, 4, 5]', %q{
+  def splatarray
+    [*(1..5)]
+  end
+
+  splatarray
+  splatarray
+}
+
+assert_equal '[1, 1, 2, 1, 2, 3]', %q{
+  def expandarray
+    arr = [1, 2, 3]
+
+    a, = arr
+    b, c, = arr
+    d, e, f = arr
+
+    [a, b, c, d, e, f]
+  end
+
+  expandarray
+  expandarray
+}
+
+assert_equal '[1, 1]', %q{
+  def expandarray_useless_splat
+    arr = (1..10).to_a
+
+    a, * = arr
+    b, (*) = arr
+
+    [a, b]
+  end
+
+  expandarray_useless_splat
+  expandarray_useless_splat
+}
+
+assert_equal '[:not_heap, nil, nil]', %q{
+  def expandarray_not_heap
+    a, b, c = :not_heap
+    [a, b, c]
+  end
+
+  expandarray_not_heap
+  expandarray_not_heap
+}
+
+assert_equal '[:not_array, nil, nil]', %q{
+  def expandarray_not_array(obj)
+    a, b, c = obj
+    [a, b, c]
+  end
+
+  obj = Object.new
+  def obj.to_ary
+    [:not_array]
+  end
+
+  expandarray_not_array(obj)
+  expandarray_not_array(obj)
+}
+
+assert_equal '[1, 2, nil]', %q{
+  def expandarray_rhs_too_small
+    a, b, c = [1, 2]
+    [a, b, c]
+  end
+
+  expandarray_rhs_too_small
+  expandarray_rhs_too_small
+}
+
+assert_equal '[1, [2]]', %q{
+  def expandarray_splat
+    a, *b = [1, 2]
+    [a, b]
+  end
+
+  expandarray_splat
+  expandarray_splat
+}
+
+assert_equal '2', %q{
+  def expandarray_postarg
+    *, a = [1, 2]
+    a
+  end
+
+  expandarray_postarg
+  expandarray_postarg
+}
+
+assert_equal '10', %q{
+  obj = Object.new
+  val = nil
+  obj.define_singleton_method(:to_ary) { val = 10; [] }
+
+  def expandarray_always_call_to_ary(object)
+    * = object
+  end
+
+  expandarray_always_call_to_ary(obj)
+  expandarray_always_call_to_ary(obj)
+
+  val
+}
+
+# regression test of local type change
+assert_equal '1.1', %q{
+def bar(baz, quux)
+  if baz.integer?
+    baz, quux = quux, nil
+  end
+  baz.to_s
+end
+
+bar(123, 1.1)
+bar(123, 1.1)
+}
+
+# test enabling a line TracePoint in a C method call
+assert_equal '[[:line, true]]', %q{
+  events = []
+  events.instance_variable_set(
+    :@tp,
+    TracePoint.new(:line) { |tp| events << [tp.event, tp.lineno] if tp.path == __FILE__ }
+  )
+  def events.to_str
+    @tp.enable; ''
+  end
+
+  # Stay in generated code while enabling tracing
+  def events.compiled(obj)
+    String(obj)
+    @tp.disable; __LINE__
+  end
+
+  line = events.compiled(events)
+  events[0][-1] = (events[0][-1] == line)
+
+  events
+}
+
+# test enabling a c_return TracePoint in a C method call
+assert_equal '[[:c_return, :String, :string_alias, "events_to_str"]]', %q{
+  events = []
+  events.instance_variable_set(:@tp, TracePoint.new(:c_return) { |tp| events << [tp.event, tp.method_id, tp.callee_id, tp.return_value] })
+  def events.to_str
+    @tp.enable; 'events_to_str'
+  end
+
+  # Stay in generated code while enabling tracing
+  alias string_alias String
+  def events.compiled(obj)
+    string_alias(obj)
+    @tp.disable
+  end
+
+  events.compiled(events)
+
+  events
+}
+
+# test enabling a TracePoint that targets a particular line in a C method call
+assert_equal '[true]', %q{
+  events = []
+  events.instance_variable_set(:@tp, TracePoint.new(:line) { |tp| events << tp.lineno })
+  def events.to_str
+    @tp.enable(target: method(:compiled))
+    ''
+  end
+
+  # Stay in generated code while enabling tracing
+  def events.compiled(obj)
+    String(obj)
+    __LINE__
+  end
+
+  line = events.compiled(events)
+  events[0] = (events[0] == line)
+
+  events
+}
+
+# test enabling tracing in the middle of splatarray
+assert_equal '[true]', %q{
+  events = []
+  obj = Object.new
+  obj.instance_variable_set(:@tp, TracePoint.new(:line) { |tp| events << tp.lineno })
+  def obj.to_a
+    @tp.enable(target: method(:compiled))
+    []
+  end
+
+  # Enable tracing in the middle of the splatarray instruction
+  def obj.compiled(obj)
+    * = *obj
+    __LINE__
+  end
+
+  obj.compiled([])
+  line = obj.compiled(obj)
+  events[0] = (events[0] == line)
+
+  events
+}
+
+# test enabling tracing in the middle of opt_aref. Different since the codegen
+# for it ends in a jump.
+assert_equal '[true]', %q{
+  def lookup(hash, tp)
+    hash[42]
+    tp.disable; __LINE__
+  end
+
+  lines = []
+  tp = TracePoint.new(:line) { lines << _1.lineno if _1.path == __FILE__ }
+
+  lookup(:foo, tp)
+  lookup({}, tp)
+
+  enable_tracing_on_missing = Hash.new { tp.enable }
+
+  expected_line = lookup(enable_tracing_on_missing, tp)
+
+  lines[0] = true if lines[0] == expected_line
+
+  lines
+}
+
+# test enabling c_call tracing before compiling
+assert_equal '[[:c_call, :itself]]', %q{
+  def shouldnt_compile
+    itself
+  end
+
+  events = []
+  tp = TracePoint.new(:c_call) { |tp| events << [tp.event, tp.method_id] }
+
+  # assume first call compiles
+  tp.enable { shouldnt_compile }
+
+  events
+}
+
+# test enabling c_return tracing before compiling
+assert_equal '[[:c_return, :itself, main]]', %q{
+  def shouldnt_compile
+    itself
+  end
+
+  events = []
+  tp = TracePoint.new(:c_return) { |tp| events << [tp.event, tp.method_id, tp.return_value] }
+
+  # assume first call compiles
+  tp.enable { shouldnt_compile }
+
+  events
+}
+
+# test enabling tracing for a suspended fiber
+assert_equal '[[:return, 42]]', %q{
+  def traced_method
+    Fiber.yield
+    42
+  end
+
+  events = []
+  tp = TracePoint.new(:return) { events << [_1.event, _1.return_value] }
+  # assume first call compiles
+  fiber = Fiber.new { traced_method }
+  fiber.resume
+  tp.enable(target: method(:traced_method))
+  fiber.resume
+
+  events
+}
+
+# test compiling on non-tracing ractor then running on a tracing one
+assert_equal '[:itself]', %q{
+  def traced_method
+    itself
+  end
+
+
+  tracing_ractor = Ractor.new do
+    # 1: start tracing
+    events = []
+    tp = TracePoint.new(:c_call) { events << _1.method_id }
+    tp.enable
+    Ractor.yield(nil)
+
+    # 3: run compiled method on tracing ractor
+    Ractor.yield(nil)
+    traced_method
+
+    events
+  ensure
+    tp&.disable
+  end
+
+  tracing_ractor.take
+
+  # 2: compile on non tracing ractor
+  traced_method
+
+  tracing_ractor.take
+  tracing_ractor.take
+}
+
+# Try to hit a lazy branch stub while another ractor enables tracing
+assert_equal '42', %q{
+  def compiled(arg)
+    if arg
+      arg + 1
+    else
+      itself
+      itself
+    end
+  end
+
+  ractor = Ractor.new do
+    compiled(false)
+    Ractor.yield(nil)
+    compiled(41)
+  end
+
+  tp = TracePoint.new(:line) { itself }
+  ractor.take
+  tp.enable
+
+  ractor.take
+}
+
+# Test equality with changing types
+assert_equal '[true, false, false, false]', %q{
+  def eq(a, b)
+    a == b
+  end
+
+  [
+    eq("foo", "foo"),
+    eq("foo", "bar"),
+    eq(:foo, "bar"),
+    eq("foo", :bar)
+  ]
+}
+
+# Redefined String eq
+assert_equal 'true', %q{
+  class String
+    def ==(other)
+      true
+    end
+  end
+
+  def eq(a, b)
+    a == b
+  end
+
+  eq("foo", "bar")
+  eq("foo", "bar")
+}
+
+# Redefined Integer eq
+assert_equal 'true', %q{
+  class Integer
+    def ==(other)
+      true
+    end
+  end
+
+  def eq(a, b)
+    a == b
+  end
+
+  eq(1, 2)
+  eq(1, 2)
+}
+
+# aset on array with invalid key
+assert_normal_exit %q{
+  def foo(arr)
+    arr[:foo] = 123
+  end
+
+  foo([1]) rescue nil
+  foo([1]) rescue nil
 }

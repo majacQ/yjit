@@ -59,7 +59,10 @@ irbの使い方は, Rubyさえ知っていればいたって簡単です. 基本
                     用しようとする.
   --colorize	    色付けを利用する.
   --nocolorize	    色付けを利用しない.
-  --prompt prompt-mode/--prompt-mode prompt-mode
+  --autocomplete    オートコンプリートを利用する.
+  --noautocomplete  オートコンプリートを利用しない.
+  --prompt prompt-mode
+  --prompt-mode prompt-mode
 		    プロンプトモードを切替えます. 現在定義されているプ
 		    ロンプトモードは, default, simple, xmp, inf-rubyが
 		    用意されています.
@@ -144,12 +147,12 @@ PROMPT_I, PROMPT_N, PROMPT_S, PROMPT_Cは, フォーマットを指定します.
 
 例えば, デフォルトのプロンプトモードは:
 
-  IRB.conf[:PROMPT_MODE][:DEFAULT] = {
+  IRB.conf[:PROMPT][:DEFAULT] = {
       :PROMPT_I => "%N(%m):%03n:%i> ",
       :PROMPT_N => "%N(%m):%03n:%i> ",
       :PROMPT_S => "%N(%m):%03n:%i%l ",
       :PROMPT_C => "%N(%m):%03n:%i* ",
-      :RETURN => "%s\n"
+      :RETURN => "=> %s\n"
   }
 
 となっています.

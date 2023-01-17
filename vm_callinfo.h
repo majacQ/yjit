@@ -1,7 +1,6 @@
 #ifndef RUBY_VM_CALLINFO_H                               /*-*-C-*-vi:se ft=c:*/
 #define RUBY_VM_CALLINFO_H
 /**
- * @file
  * @author     Ruby developers <ruby-core@ruby-lang.org>
  * @copyright  This  file  is   a  part  of  the   programming  language  Ruby.
  *             Permission  is hereby  granted,  to  either redistribute  and/or
@@ -410,7 +409,16 @@ vm_cc_method_missing_reason_set(const struct rb_callcache *cc, enum method_missi
     *(enum method_missing_reason *)&cc->aux_.method_missing_reason = reason;
 }
 
-void rb_vm_cc_invalidate(const struct rb_callcache *cc);
+static inline void
+vm_cc_invalidate(const struct rb_callcache *cc)
+{
+    VM_ASSERT(IMEMO_TYPE_P(cc, imemo_callcache));
+    VM_ASSERT(cc != vm_cc_empty());
+    VM_ASSERT(cc->klass != 0); // should be enable
+
+    *(VALUE *)&cc->klass = 0;
+    RB_DEBUG_COUNTER_INC(cc_ent_invalidate);
+}
 
 /* calldata */
 

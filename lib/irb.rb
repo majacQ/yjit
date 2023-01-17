@@ -72,6 +72,8 @@ require_relative "irb/easter-egg"
 #     --nosingleline    Don't use singleline editor module
 #     --colorize        Use colorization
 #     --nocolorize      Don't use colorization
+#     --autocomplete    Use autocompletion
+#     --noautocomplete  Don't use autocompletion
 #     --prompt prompt-mode/--prompt-mode prompt-mode
 #                       Switch prompt mode. Pre-defined prompt modes are
 #                       `default', `simple', `xmp' and `inf-ruby'
@@ -114,6 +116,7 @@ require_relative "irb/easter-egg"
 #     IRB.conf[:USE_SINGLELINE] = nil
 #     IRB.conf[:USE_COLORIZE] = true
 #     IRB.conf[:USE_TRACER] = false
+#     IRB.conf[:USE_AUTOCOMPLETE] = true
 #     IRB.conf[:IGNORE_SIGINT] = true
 #     IRB.conf[:IGNORE_EOF] = false
 #     IRB.conf[:PROMPT_MODE] = :DEFAULT
@@ -524,7 +527,7 @@ module IRB
         @context.io.prompt
       end
 
-      @scanner.set_input(@context.io) do
+      @scanner.set_input(@context.io, context: @context) do
         signal_status(:IN_INPUT) do
           if l = @context.io.gets
             print l if @context.verbose?
@@ -666,6 +669,8 @@ module IRB
           lines = lines.reverse if order == :bottom
           lines.map{ |l| l + "\n" }.join
         }
+        # The "<top (required)>" in "(irb)" may be the top level of IRB so imitate the main object.
+        message = message.gsub(/\(irb\):(?<num>\d+):in `<(?<frame>top \(required\))>'/)  { "(irb):#{$~[:num]}:in `<main>'" }
         puts message
       end
       print "Maybe IRB bug!\n" if irb_bug

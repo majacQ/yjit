@@ -79,7 +79,7 @@ error !
                  (reg_cfp->pc - reg_cfp->iseq->body->iseq_encoded), \
                  RSTRING_PTR(rb_iseq_path(reg_cfp->iseq)), \
                  rb_iseq_line_no(reg_cfp->iseq, reg_pc - reg_cfp->iseq->body->iseq_encoded)); \
-  if (USE_INSNS_COUNTER && BIN(insn) != BIN(yjit_call_example_with_ec)) vm_insns_counter_count_insn(BIN(insn));
+  if (USE_INSNS_COUNTER) vm_insns_counter_count_insn(BIN(insn));
 
 #define INSN_DISPATCH_SIG(insn)
 
@@ -130,9 +130,6 @@ error !
 
 #define NEXT_INSN() TC_DISPATCH(__NEXT_INSN__)
 
-#define START_OF_ORIGINAL_INSN(x) start_of_##x:
-#define DISPATCH_ORIGINAL_INSN(x) goto  start_of_##x;
-
 /************************************************/
 #else /* no threaded code */
 /* most common method */
@@ -157,9 +154,11 @@ default:                        \
 
 #define NEXT_INSN() goto first
 
-#define START_OF_ORIGINAL_INSN(x) start_of_##x:
-#define DISPATCH_ORIGINAL_INSN(x) goto  start_of_##x;
+#endif
 
+#ifndef START_OF_ORIGINAL_INSN
+#define START_OF_ORIGINAL_INSN(x) if (0) goto start_of_##x; start_of_##x:
+#define DISPATCH_ORIGINAL_INSN(x) goto  start_of_##x;
 #endif
 
 #define VM_SP_CNT(ec, sp) ((sp) - (ec)->vm_stack)

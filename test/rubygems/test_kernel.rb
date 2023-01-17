@@ -1,5 +1,5 @@
 # frozen_string_literal: true
-require 'rubygems/test_case'
+require_relative 'helper'
 
 class TestKernel < Gem::TestCase
   def setup
@@ -8,6 +8,8 @@ class TestKernel < Gem::TestCase
     @old_path = $:.dup
 
     util_make_gems
+
+    without_any_upwards_gemfiles
   end
 
   def teardown

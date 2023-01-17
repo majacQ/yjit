@@ -1,5 +1,5 @@
 # frozen_string_literal: true
-require 'rubygems/installer_test_case'
+require_relative 'installer_test_case'
 
 class TestGemInstaller < Gem::InstallerTestCase
   def setup
@@ -32,6 +32,8 @@ class TestGemInstaller < Gem::InstallerTestCase
 #
 
 require 'rubygems'
+
+Gem.use_gemdeps
 
 version = \">= 0.a\"
 
@@ -222,7 +224,7 @@ gem 'other', version
   end
 
   def test_check_that_user_bin_dir_is_in_path_tilde
-    skip "Tilde is PATH is not supported under MS Windows" if win_platform?
+    pend "Tilde is PATH is not supported under MS Windows" if win_platform?
 
     orig_PATH, ENV['PATH'] =
       ENV['PATH'], [ENV['PATH'], '~/bin'].join(File::PATH_SEPARATOR)
@@ -287,7 +289,7 @@ gem 'other', version
   end
 
   def test_ensure_loadable_spec_security_policy
-    skip 'openssl is missing' unless Gem::HAVE_OPENSSL
+    pend 'openssl is missing' unless Gem::HAVE_OPENSSL
 
     _, a_gem = util_gem 'a', 2 do |s|
       s.add_dependency 'garbage ~> 5'
@@ -525,7 +527,7 @@ gem 'other', version
   end
 
   def test_generate_bin_symlink
-    skip "Symlinks not supported or not enabled" unless symlink_supported?
+    pend "Symlinks not supported or not enabled" unless symlink_supported?
 
     installer = setup_base_installer
 
@@ -577,7 +579,7 @@ gem 'other', version
   end
 
   def test_generate_bin_symlink_update_newer
-    skip "Symlinks not supported or not enabled" unless symlink_supported?
+    pend "Symlinks not supported or not enabled" unless symlink_supported?
 
     installer = setup_base_installer
 
@@ -609,7 +611,7 @@ gem 'other', version
   end
 
   def test_generate_bin_symlink_update_older
-    skip "Symlinks not supported or not enabled" unless symlink_supported?
+    pend "Symlinks not supported or not enabled" unless symlink_supported?
 
     installer = setup_base_installer
 
@@ -647,7 +649,7 @@ gem 'other', version
   end
 
   def test_generate_bin_symlink_update_remove_wrapper
-    skip "Symlinks not supported or not enabled" unless symlink_supported?
+    pend "Symlinks not supported or not enabled" unless symlink_supported?
 
     installer = setup_base_installer
 
@@ -720,7 +722,7 @@ gem 'other', version
   end
 
   def test_generate_bin_uses_default_shebang
-    skip "Symlinks not supported or not enabled" unless symlink_supported?
+    pend "Symlinks not supported or not enabled" unless symlink_supported?
 
     installer = setup_base_installer
 
@@ -740,7 +742,6 @@ gem 'other', version
 
     installer = Gem::Installer.at(
       gem_with_dangling_symlink,
-      :install_dir => @gem_home,
       :user_install => false,
       :force => true
     )
@@ -1435,7 +1436,7 @@ gem 'other', version
   end
 
   def test_find_lib_file_after_install
-    skip "extensions don't quite work on jruby" if Gem.java_platform?
+    pend "extensions don't quite work on jruby" if Gem.java_platform?
 
     @spec = setup_base_spec
     @spec.extensions << "extconf.rb"
@@ -1481,8 +1482,8 @@ gem 'other', version
   end
 
   def test_install_extension_and_script
-    skip "Makefile creation crashes on jruby" if Gem.java_platform?
-    skip if /mswin/ =~ RUBY_PLATFORM && ENV.key?('GITHUB_ACTIONS') # not working from the beginning
+    pend "Makefile creation crashes on jruby" if Gem.java_platform?
+    pend if /mswin/ =~ RUBY_PLATFORM && ENV.key?('GITHUB_ACTIONS') # not working from the beginning
 
     @spec = setup_base_spec
     @spec.extensions << "extconf.rb"
@@ -1523,7 +1524,7 @@ gem 'other', version
   end
 
   def test_install_extension_flat
-    skip "extensions don't quite work on jruby" if Gem.java_platform?
+    pend "extensions don't quite work on jruby" if Gem.java_platform?
 
     begin
       @spec = setup_base_spec
@@ -1712,7 +1713,7 @@ gem 'other', version
   end
 
   def test_pre_install_checks_malicious_extensions_before_eval
-    skip "mswin environment disallow to create file contained the carriage return code." if Gem.win_platform?
+    pend "mswin environment disallow to create file contained the carriage return code." if Gem.win_platform?
 
     spec = util_spec "malicious", '1'
     def spec.full_name # so the spec is buildable
@@ -1774,6 +1775,26 @@ gem 'other', version
         installer.pre_install_checks
       end
       assert_equal "#<Gem::Specification name=malicious version=1> has an invalid dependencies", e.message
+    end
+  end
+
+  def test_pre_install_checks_malicious_platform_before_eval
+    gem_with_ill_formated_platform = File.expand_path("packages/ill-formatted-platform-1.0.0.10.gem", __dir__)
+
+    installer = Gem::Installer.at(
+      gem_with_ill_formated_platform,
+      :install_dir => @gem_home,
+      :user_install => false,
+      :force => true
+    )
+
+    use_ui @ui do
+      e = assert_raise Gem::InstallError do
+        installer.pre_install_checks
+      end
+
+      assert_equal "x86-mswin32\n system('id > /tmp/nyangawa')# is an invalid platform", e.message
+      assert_empty @ui.output
     end
   end
 

@@ -44,7 +44,7 @@
 # include <wincrypt.h>
 #endif
 
-#if defined(__OpenBSD__) || defined(__FreeBSD__)
+#if defined(__OpenBSD__) || defined(__FreeBSD__) || defined(__NetBSD__)
 /* to define OpenBSD and FreeBSD for version check */
 # include <sys/param.h>
 #endif
@@ -1196,7 +1196,7 @@ rand_bytes(const rb_random_interface_t *rng, rb_random_t *rnd, long n)
 
     bytes = rb_str_new(0, n);
     ptr = RSTRING_PTR(bytes);
-    rb_rand_bytes_int32(rng->get_int32, rnd, ptr, n);
+    rng->get_bytes(rnd, ptr, n);
     return bytes;
 }
 
@@ -1348,7 +1348,7 @@ static inline double
 float_value(VALUE v)
 {
     double x = RFLOAT_VALUE(v);
-    if (isinf(x) || isnan(x)) {
+    if (!isfinite(x)) {
 	domain_error();
     }
     return x;

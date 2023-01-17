@@ -2490,7 +2490,7 @@ class TestRefinement < Test::Unit::TestCase
 
   def test_defining_after_cached
     klass = Class.new
-    refinement = Module.new { refine(klass) { def foo; end } }
+    _refinement = Module.new { refine(klass) { def foo; end } }
     klass.new.foo rescue nil # cache the refinement method entry
     klass.define_method(:foo) { 42 }
     assert_equal(42, klass.new.foo)
@@ -2535,6 +2535,40 @@ class TestRefinement < Test::Unit::TestCase
     klass.new.foo # cache foo
     klass.define_method(:foo) { :second }
     assert_equal(:second, klass.new.foo)
+  end
+
+  class Bug17822
+    module Ext
+      refine(Bug17822) do
+        def foo = :refined
+      end
+    end
+
+    private(def foo = :not_refined)
+
+    module Client
+      using Ext
+      def self.call_foo
+        Bug17822.new.foo
+      end
+    end
+  end
+
+  # [Bug #17822]
+  def test_privatizing_refined_method
+    assert_equal(:refined, Bug17822::Client.call_foo)
+  end
+
+  def test_ancestors
+    refinement = nil
+    as = nil
+    Module.new do
+      refine Array do
+        refinement = self
+        as = ancestors
+      end
+    end
+    assert_equal([refinement], as, "[ruby-core:86949] [Bug #14744]")
   end
 
   private
