@@ -323,7 +323,6 @@ rb_iseq_update_references(rb_iseq_t *iseq)
 #if USE_MJIT
         mjit_update_references(iseq);
 #endif
-        rb_yjit_iseq_update_references(body);
     }
 }
 
@@ -404,7 +403,7 @@ rb_iseq_mark(const rb_iseq_t *iseq)
 #if USE_MJIT
         mjit_mark_cc_entries(body);
 #endif
-        rb_yjit_iseq_mark(body);
+        rb_yjit_mark_iseq_entry_blocks(iseq);
     }
 
     if (FL_TEST_RAW((VALUE)iseq, ISEQ_NOT_LOADED_YET)) {
@@ -3436,6 +3435,32 @@ rb_iseq_trace_set(const rb_iseq_t *iseq, rb_event_flag_t turnon_events)
     }
 }
 
+bool rb_vm_call_ivar_attrset_p(const vm_call_handler ch);
+void rb_vm_cc_general(const struct rb_callcache *cc);
+
+static int
+clear_attr_ccs_i(void *vstart, void *vend, size_t stride, void *data)
+{
+    VALUE v = (VALUE)vstart;
+    for (; v != (VALUE)vend; v += stride) {
+        void *ptr = asan_poisoned_object_p(v);
+        asan_unpoison_object(v, false);
+
+        if (imemo_type_p(v, imemo_callcache) && rb_vm_call_ivar_attrset_p(((const struct rb_callcache *)v)->call_)) {
+            rb_vm_cc_general((struct rb_callcache *)v);
+        }
+
+        asan_poison_object_if(ptr, v);
+    }
+    return 0;
+}
+
+void
+rb_clear_attr_ccs(void)
+{
+    rb_objspace_each_objects(clear_attr_ccs_i, NULL);
+}
+
 static int
 trace_set_i(void *vstart, void *vend, size_t stride, void *data)
 {
@@ -3449,6 +3474,9 @@ trace_set_i(void *vstart, void *vend, size_t stride, void *data)
 	if (rb_obj_is_iseq(v)) {
 	    rb_iseq_trace_set(rb_iseq_check((rb_iseq_t *)v), turnon_events);
 	}
+        else if (imemo_type_p(v, imemo_callcache) && rb_vm_call_ivar_attrset_p(((const struct rb_callcache *)v)->call_)) {
+            rb_vm_cc_general((struct rb_callcache *)v);
+        }
 
         asan_poison_object_if(ptr, v);
     }
