@@ -7,7 +7,7 @@
 YJIT - Yet Another Ruby JIT
 ===========================
 
-YJIT has been merged upstream, and is now an official part of Ruby 3.1 and 3.2.
+YJIT has been merged upstream, and is now an official part of Ruby 3.1+.
 
 For more information on how to build and use YJIT, see the [YJIT README](https://github.com/ruby/ruby/blob/master/doc/yjit/yjit.md).
 
